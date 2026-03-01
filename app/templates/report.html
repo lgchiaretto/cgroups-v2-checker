@@ -1,0 +1,232 @@
+{% extends "base.html" %}
+{% block title %}Report {{ report_id }} - cgroups v2 Checker{% endblock %}
+
+{% block content %}
+<!-- Header -->
+<div class="pf-v6-l-flex pf-m-justify-content-space-between pf-m-align-items-center pf-v6-u-mb-lg">
+  <div>
+    <h1 class="pf-v6-c-title pf-m-2xl">Scan Report</h1>
+    <p class="pf-v6-u-color-200 pf-v6-u-mt-sm">
+      {{ report.generated_at[:19] | replace("T", " ") }}
+      {% if report.cluster_info.get("openshift_version") %}
+      &mdash; OpenShift {{ report.cluster_info.openshift_version }}
+      {% endif %}
+    </p>
+  </div>
+  <div>
+    <a href="/reports/{{ report_id }}/download" class="pf-v6-c-button pf-m-secondary">
+      <i class="fas fa-download pf-v6-u-mr-sm"></i> Download JSON
+    </a>
+    <a href="/" class="pf-v6-c-button pf-m-link">
+      <i class="fas fa-arrow-left pf-v6-u-mr-sm"></i> Back
+    </a>
+  </div>
+</div>
+
+  <!-- Summary cards -->
+  <div class="pf-v6-l-gallery pf-m-gutter pf-v6-u-mb-lg" style="--pf-v6-l-gallery--GridTemplateColumns--min: 160px;">
+    <div class="pf-v6-c-card">
+      <div class="pf-v6-c-card__body">
+        <div class="pf-v6-u-font-size-3xl pf-v6-u-font-weight-bold">{{ report.total_images }}</div>
+        <div class="pf-v6-u-color-200">Total images</div>
+      </div>
+    </div>
+    <div class="pf-v6-c-card">
+      <div class="pf-v6-c-card__body">
+        <div class="pf-v6-u-font-size-3xl pf-v6-u-font-weight-bold">{{ report.inspected_via_skopeo }}</div>
+        <div class="pf-v6-u-color-200">Inspected via skopeo</div>
+      </div>
+    </div>
+    {% set sev_colors = {"CRITICAL": "red", "HIGH": "orange", "MEDIUM": "gold", "LOW": "blue", "OK": "green"} %}
+    {% for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "OK"] %}
+    {% set count = report.by_severity.get(sev, 0) %}
+    <div class="pf-v6-c-card">
+      <div class="pf-v6-c-card__body">
+        <div class="pf-v6-u-font-size-3xl pf-v6-u-font-weight-bold">
+          {% if count > 0 and sev != "OK" %}
+          <span class="pf-v6-c-label pf-m-{{ sev_colors[sev] }}"><span class="pf-v6-c-label__content">{{ count }}</span></span>
+          {% else %}
+          {{ count }}
+          {% endif %}
+        </div>
+        <div class="pf-v6-u-color-200">{{ sev }}</div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <!-- Cluster info -->
+  {% if report.cluster_info %}
+  <div class="pf-v6-c-card pf-v6-u-mb-lg">
+    <div class="pf-v6-c-card__header">
+      <div class="pf-v6-c-card__header-main"><strong><i class="fas fa-server pf-v6-u-mr-sm"></i> Cluster Info</strong></div>
+    </div>
+    <div class="pf-v6-c-card__body">
+      <dl class="pf-v6-c-description-list pf-m-horizontal pf-m-compact">
+        {% for key, val in report.cluster_info.items() %}
+        <div class="pf-v6-c-description-list__group">
+          <dt class="pf-v6-c-description-list__term"><span class="pf-v6-c-description-list__text">{{ key | replace("_", " ") | title }}</span></dt>
+          <dd class="pf-v6-c-description-list__description"><div class="pf-v6-c-description-list__text">{{ val }}</div></dd>
+        </div>
+        {% endfor %}
+      </dl>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Filter bar -->
+  <div class="pf-v6-c-card pf-v6-u-mb-md">
+    <div class="pf-v6-c-card__body">
+      <div class="pf-v6-l-flex pf-m-align-items-center pf-m-gap-md">
+        <div class="pf-v6-c-search-input" style="max-width: 360px; flex: 1;">
+          <div class="pf-v6-c-search-input__bar">
+            <span class="pf-v6-c-search-input__icon"><i class="fas fa-search"></i></span>
+            <input class="pf-v6-c-search-input__text-input" type="text" id="filter-text"
+                   placeholder="Filter by image name..." aria-label="Filter images">
+          </div>
+        </div>
+        <div class="pf-v6-l-flex pf-m-gap-sm" id="severity-filters">
+          {% for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "OK"] %}
+          <button class="pf-v6-c-label pf-m-{{ sev_colors[sev] }} severity-filter pf-m-outline"
+                  data-severity="{{ sev }}" title="Toggle {{ sev }}">
+            <span class="pf-v6-c-label__content">{{ sev }}</span>
+          </button>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Images table -->
+  <div class="pf-v6-c-card">
+    <div class="pf-v6-c-card__body">
+      <table class="pf-v6-c-table pf-m-grid-md pf-m-compact" role="grid" id="images-table">
+        <thead>
+          <tr role="row">
+            <th role="columnheader">Severity</th>
+            <th role="columnheader">Image</th>
+            <th role="columnheader">Pods</th>
+            <th role="columnheader">Namespaces</th>
+            <th role="columnheader">Findings</th>
+            <th role="columnheader">Inspected</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for img in report.images %}
+          <tr role="row" class="image-row" data-severity="{{ img.max_severity }}" data-image="{{ img.image | lower }}">
+            <td role="cell" data-label="Severity">
+              {% set s = img.max_severity %}
+              <span class="pf-v6-c-label pf-m-{{ sev_colors.get(s, 'blue') }}"><span class="pf-v6-c-label__content">{{ s }}</span></span>
+            </td>
+            <td role="cell" data-label="Image" class="pf-v6-u-text-break-word" style="max-width: 420px;">
+              <code>{{ img.image }}</code>
+            </td>
+            <td role="cell" data-label="Pods">{{ img.pod_count }}</td>
+            <td role="cell" data-label="Namespaces">
+              {% for ns in img.namespaces[:3] %}
+              <span class="pf-v6-c-label pf-m-compact pf-v6-u-mr-xs"><span class="pf-v6-c-label__content">{{ ns }}</span></span>
+              {% endfor %}
+              {% if img.namespaces | length > 3 %}<span class="pf-v6-u-color-200">+{{ img.namespaces | length - 3 }} more</span>{% endif %}
+            </td>
+            <td role="cell" data-label="Findings">
+              {% if img.findings %}
+              <button class="pf-v6-c-button pf-m-link pf-m-small btn-toggle-findings" title="Show findings">
+                {{ img.findings | length }} finding{{ "s" if img.findings | length > 1 }}
+                <i class="fas fa-chevron-down pf-v6-u-ml-xs"></i>
+              </button>
+              {% else %}
+              <span class="pf-v6-u-color-200">None</span>
+              {% endif %}
+            </td>
+            <td role="cell" data-label="Inspected">
+              {% if img.inspected %}
+              <i class="fas fa-check-circle pf-v6-u-success-color-100" title="Inspected via skopeo"></i>
+              {% elif img.inspection_error %}
+              <i class="fas fa-exclamation-triangle pf-v6-u-warning-color-100" title="{{ img.inspection_error }}"></i>
+              {% else %}
+              <i class="fas fa-minus pf-v6-u-color-200" title="Not inspected"></i>
+              {% endif %}
+            </td>
+          </tr>
+          {% if img.findings %}
+          <tr class="findings-row" style="display:none;">
+            <td colspan="6" style="padding: 0;">
+              <div class="pf-v6-u-p-md pf-v6-u-background-color-200">
+                {% for f in img.findings %}
+                <div class="pf-v6-c-alert pf-m-{{ 'danger' if f.severity == 'CRITICAL' else ('warning' if f.severity in ['HIGH', 'MEDIUM'] else 'info') }} pf-m-inline pf-m-plain pf-v6-u-mb-sm">
+                  <div class="pf-v6-c-alert__icon">
+                    <i class="fas fa-{% if f.severity == 'CRITICAL' %}exclamation-circle{% elif f.severity in ['HIGH', 'MEDIUM'] %}exclamation-triangle{% else %}info-circle{% endif %}"></i>
+                  </div>
+                  <h4 class="pf-v6-c-alert__title">
+                    <strong>[{{ f.category }}]</strong> {{ f.message }}
+                  </h4>
+                  <div class="pf-v6-c-alert__description">
+                    <p>{{ f.recommendation }}</p>
+                    {% if f.details %}<p class="pf-v6-u-color-200 pf-v6-u-mt-xs"><small>{{ f.details }}</small></p>{% endif %}
+                  </div>
+                </div>
+                {% endfor %}
+              </div>
+            </td>
+          </tr>
+          {% endif %}
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function() {
+  // Toggle findings rows
+  document.querySelectorAll(".btn-toggle-findings").forEach(function(btn) {
+    btn.addEventListener("click", function() {
+      const row = btn.closest("tr").nextElementSibling;
+      if (row && row.classList.contains("findings-row")) {
+        const visible = row.style.display !== "none";
+        row.style.display = visible ? "none" : "";
+        btn.querySelector("i").className = visible ? "fas fa-chevron-down pf-v6-u-ml-xs" : "fas fa-chevron-up pf-v6-u-ml-xs";
+      }
+    });
+  });
+
+  // Text filter
+  const filterInput = document.getElementById("filter-text");
+  filterInput.addEventListener("input", applyFilters);
+
+  // Severity filters
+  const activeFilters = new Set();
+  document.querySelectorAll(".severity-filter").forEach(function(btn) {
+    btn.addEventListener("click", function() {
+      const sev = btn.dataset.severity;
+      if (activeFilters.has(sev)) {
+        activeFilters.delete(sev);
+        btn.classList.add("pf-m-outline");
+      } else {
+        activeFilters.add(sev);
+        btn.classList.remove("pf-m-outline");
+      }
+      applyFilters();
+    });
+  });
+
+  function applyFilters() {
+    const text = filterInput.value.toLowerCase();
+    document.querySelectorAll(".image-row").forEach(function(row) {
+      const img = row.dataset.image;
+      const sev = row.dataset.severity;
+      const textMatch = !text || img.includes(text);
+      const sevMatch = activeFilters.size === 0 || activeFilters.has(sev);
+      row.style.display = (textMatch && sevMatch) ? "" : "none";
+      // Also hide findings row
+      const next = row.nextElementSibling;
+      if (next && next.classList.contains("findings-row") && row.style.display === "none") {
+        next.style.display = "none";
+      }
+    });
+  }
+});
+</script>
+{% endblock %}

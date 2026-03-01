@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Error - cgroups v2 Checker{% endblock %}
+
+{% block content %}
+<div class="pf-v6-c-empty-state">
+  <div class="pf-v6-c-empty-state__content">
+    <i class="pf-v6-c-empty-state__icon fas fa-exclamation-triangle pf-v6-u-danger-color-100" aria-hidden="true"></i>
+    <h2 class="pf-v6-c-empty-state__title-text">Error</h2>
+    <div class="pf-v6-c-empty-state__body">{{ message }}</div>
+    <div class="pf-v6-c-empty-state__actions">
+      <a href="/" class="pf-v6-c-button pf-m-primary">Back to Dashboard</a>
+    </div>
+  </div>
+</div>
+{% endblock %}

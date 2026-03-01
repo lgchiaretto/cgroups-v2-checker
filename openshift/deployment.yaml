@@ -1,0 +1,91 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cgroups-v2-checker
+  namespace: cgroups-v2-checker
+  labels:
+    app.kubernetes.io/name: cgroups-v2-checker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cgroups-v2-checker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cgroups-v2-checker
+    spec:
+      serviceAccountName: cgroups-v2-checker
+      containers:
+        - name: checker
+          image: quay.io/chiaretto/cgroups-v2-checker:latest
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          env:
+            - name: REPORT_DIR
+              value: /app/data/reports
+            - name: SKIP_SYSTEM_NAMESPACES
+              value: "true"
+            - name: SKOPEO_TLS_VERIFY
+              value: "true"
+            - name: SKOPEO_MAX_WORKERS
+              value: "10"
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cgroups-v2-checker
+  namespace: cgroups-v2-checker
+  labels:
+    app.kubernetes.io/name: cgroups-v2-checker
+spec:
+  selector:
+    app.kubernetes.io/name: cgroups-v2-checker
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: cgroups-v2-checker
+  namespace: cgroups-v2-checker
+  labels:
+    app.kubernetes.io/name: cgroups-v2-checker
+spec:
+  to:
+    kind: Service
+    name: cgroups-v2-checker
+  port:
+    targetPort: 8080
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

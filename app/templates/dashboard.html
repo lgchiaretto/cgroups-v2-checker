@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - cgroups v2 Checker{% endblock %}
+
+{% block content %}
+<!-- Page header -->
+<div class="pf-v6-l-flex pf-m-justify-content-space-between pf-m-align-items-center pf-v6-u-mb-lg">
+  <div>
+    <h1 class="pf-v6-c-title pf-m-2xl">cgroups v2 Compatibility Dashboard</h1>
+    <p class="pf-v6-u-color-200 pf-v6-u-mt-sm">
+      Scan your OpenShift cluster to identify container images that need changes before upgrading to OCP 4.19.
+    </p>
+  </div>
+  <div>
+    <button id="btn-start-scan" class="pf-v6-c-button pf-m-primary" type="button">
+      <i class="fas fa-magnifying-glass pf-v6-u-mr-sm"></i> New Scan
+    </button>
+  </div>
+</div>
+
+<!-- Scan progress panel (hidden by default) -->
+<div id="scan-progress-panel" class="pf-v6-c-card pf-v6-u-mb-lg" style="display:none;">
+  <div class="pf-v6-c-card__header">
+    <div class="pf-v6-c-card__header-main">
+      <i class="fas fa-spinner fa-spin pf-v6-u-mr-sm"></i>
+      <strong id="scan-progress-title">Scan in progress...</strong>
+    </div>
+  </div>
+  <div class="pf-v6-c-card__body">
+    <div class="pf-v6-c-progress" id="scan-progress-bar">
+      <div class="pf-v6-c-progress__description" id="scan-progress-detail">Initializing...</div>
+      <div class="pf-v6-c-progress__status" aria-hidden="true">
+        <span class="pf-v6-c-progress__measure" id="scan-progress-pct">0%</span>
+      </div>
+      <div class="pf-v6-c-progress__bar" role="progressbar"
+           aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="pf-v6-c-progress__indicator" style="width: 0%;" id="scan-progress-indicator"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Scan options panel (hidden by default) -->
+<div id="scan-options-panel" class="pf-v6-c-card pf-v6-u-mb-lg" style="display:none;">
+  <div class="pf-v6-c-card__header">
+    <div class="pf-v6-c-card__header-main"><strong>Scan Options</strong></div>
+  </div>
+  <div class="pf-v6-c-card__body">
+    <form id="scan-options-form">
+      <div class="pf-v6-c-form__group pf-v6-u-mb-md">
+        <label class="pf-v6-c-form__label" for="opt-namespaces">
+          <span class="pf-v6-c-form__label-text">Namespaces</span>
+        </label>
+        <span class="pf-v6-c-form__helper-text">Comma-separated list. Leave empty for all namespaces.</span>
+        <input class="pf-v6-c-form-control" type="text" id="opt-namespaces" placeholder="e.g. my-app, staging">
+      </div>
+      <div class="pf-v6-c-form__group pf-v6-u-mb-md">
+        <label class="pf-v6-c-form__label" for="opt-exclude">
+          <span class="pf-v6-c-form__label-text">Exclude Namespaces</span>
+        </label>
+        <input class="pf-v6-c-form-control" type="text" id="opt-exclude" placeholder="e.g. test, sandbox">
+      </div>
+      <div class="pf-v6-c-check pf-v6-u-mb-md">
+        <input class="pf-v6-c-check__input" type="checkbox" id="opt-inspect" checked>
+        <label class="pf-v6-c-check__label" for="opt-inspect">Enable skopeo remote inspection (Level 2)</label>
+        <span class="pf-v6-c-check__description">Uses skopeo to read image metadata. No layers are downloaded.</span>
+      </div>
+      <div class="pf-v6-l-flex pf-m-gap-sm">
+        <button type="submit" class="pf-v6-c-button pf-m-primary">
+          <i class="fas fa-play pf-v6-u-mr-sm"></i> Start Scan
+        </button>
+        <button type="button" class="pf-v6-c-button pf-m-secondary" id="btn-cancel-options">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Reports table -->
+<div class="pf-v6-c-card">
+  <div class="pf-v6-c-card__header">
+    <div class="pf-v6-c-card__header-main">
+      <strong><i class="fas fa-file-lines pf-v6-u-mr-sm"></i> Scan Reports</strong>
+    </div>
+  </div>
+  <div class="pf-v6-c-card__body">
+    {% if reports %}
+    <table class="pf-v6-c-table pf-m-grid-md pf-m-compact" role="grid">
+      <thead>
+        <tr role="row">
+          <th role="columnheader">Date</th>
+          <th role="columnheader">Images</th>
+          <th role="columnheader">Critical</th>
+          <th role="columnheader">High</th>
+          <th role="columnheader">Medium</th>
+          <th role="columnheader">Low</th>
+          <th role="columnheader">OK</th>
+          <th role="columnheader">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in reports %}
+        <tr role="row">
+          <td role="cell" data-label="Date">{{ r.generated_at[:19] | replace("T", " ") }}</td>
+          <td role="cell" data-label="Images">{{ r.total_images }}</td>
+          <td role="cell" data-label="Critical">
+            {% set crit = r.by_severity.get("CRITICAL", 0) %}
+            {% if crit > 0 %}
+              <span class="pf-v6-c-label pf-m-red"><span class="pf-v6-c-label__content">{{ crit }}</span></span>
+            {% else %}0{% endif %}
+          </td>
+          <td role="cell" data-label="High">
+            {% set high = r.by_severity.get("HIGH", 0) %}
+            {% if high > 0 %}
+              <span class="pf-v6-c-label pf-m-orange"><span class="pf-v6-c-label__content">{{ high }}</span></span>
+            {% else %}0{% endif %}
+          </td>
+          <td role="cell" data-label="Medium">
+            {% set med = r.by_severity.get("MEDIUM", 0) %}
+            {% if med > 0 %}
+              <span class="pf-v6-c-label pf-m-gold"><span class="pf-v6-c-label__content">{{ med }}</span></span>
+            {% else %}0{% endif %}
+          </td>
+          <td role="cell" data-label="Low">{{ r.by_severity.get("LOW", 0) }}</td>
+          <td role="cell" data-label="OK">{{ r.by_severity.get("OK", 0) }}</td>
+          <td role="cell" data-label="Actions">
+            <a href="/reports/{{ r.id }}" class="pf-v6-c-button pf-m-link pf-m-small" title="View">
+              <i class="fas fa-eye"></i>
+            </a>
+            <a href="/reports/{{ r.id }}/download" class="pf-v6-c-button pf-m-link pf-m-small" title="Download">
+              <i class="fas fa-download"></i>
+            </a>
+            <button class="pf-v6-c-button pf-m-link pf-m-small btn-delete-report" data-report-id="{{ r.id }}" title="Delete">
+              <i class="fas fa-trash"></i>
+            </button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="pf-v6-c-empty-state">
+      <div class="pf-v6-c-empty-state__content">
+        <i class="pf-v6-c-empty-state__icon fas fa-search" aria-hidden="true"></i>
+        <h2 class="pf-v6-c-empty-state__title-text">No reports yet</h2>
+        <div class="pf-v6-c-empty-state__body">
+          Click <strong>New Scan</strong> to run your first cluster scan.
+        </div>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

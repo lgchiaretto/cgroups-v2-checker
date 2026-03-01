@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en" class="pf-v6-theme-dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}cgroups v2 Checker{% endblock %}</title>
+
+    <!-- DNS Prefetch and Preconnect for all CDNs -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="preconnect" href="https://unpkg.com" crossorigin>
+    <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+
+    <!-- Red Hat Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Red+Hat+Display:wght@400;500;600;700&family=Red+Hat+Text:wght@400;500;600&family=Red+Hat+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <!-- PatternFly 6 CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/@patternfly/patternfly@6.4.0/patternfly.min.css" crossorigin="anonymous">
+    <link rel="stylesheet" href="https://unpkg.com/@patternfly/patternfly@6.4.0/patternfly-addons.min.css" crossorigin="anonymous">
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" crossorigin="anonymous">
+
+    <!-- App CSS -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+    {% block extra_css %}{% endblock %}
+</head>
+<body>
+    <div class="pf-v6-c-page pf-m-sidebar-expanded">
+        <!-- Skip to content link for accessibility -->
+        <a class="pf-v6-c-skip-to-content pf-v6-c-button pf-m-primary" href="#main-content">Skip to content</a>
+
+        <!-- Masthead -->
+        <header class="pf-v6-c-masthead">
+            <div class="pf-v6-c-masthead__main">
+                <!-- Mobile menu toggle -->
+                <span class="pf-v6-c-masthead__toggle">
+                    <button class="pf-v6-c-button pf-m-plain" type="button" aria-label="Toggle navigation" id="nav-toggle">
+                        <i class="fas fa-bars"></i>
+                    </button>
+                </span>
+                <!-- Logo and Brand -->
+                <a class="pf-v6-c-masthead__brand pf-v6-l-flex pf-m-align-items-center pf-m-gap-sm pf-v6-u-text-decoration-none" href="/">
+                    <img src="{{ url_for('static', filename='icons/openshift.svg') }}" alt="OpenShift" class="masthead-logo" width="36" height="36">
+                    <div class="pf-v6-l-stack">
+                        <span class="pf-v6-c-title pf-m-md pf-v6-u-color-100">cgroups v2 Checker</span>
+                        <span class="pf-v6-u-color-200 pf-v6-u-font-size-xs">OpenShift 4.19 Readiness</span>
+                    </div>
+                </a>
+            </div>
+            <div class="pf-v6-c-masthead__content">
+                <div class="pf-v6-l-flex pf-m-align-items-center pf-m-justify-content-flex-end pf-m-flex-1">
+                </div>
+            </div>
+        </header>
+
+        <!-- Sidebar Navigation -->
+        <div class="pf-v6-c-page__sidebar pf-m-expanded" id="page-sidebar">
+            <div class="pf-v6-c-page__sidebar-body">
+                <nav class="pf-v6-c-nav" aria-label="Global navigation">
+                    <ul class="pf-v6-c-nav__list">
+                        <!-- Home -->
+                        <li class="pf-v6-c-nav__item">
+                            <a class="pf-v6-c-nav__link{% if request.path == '/' %} pf-m-current{% endif %}" href="/">
+                                Home
+                            </a>
+                        </li>
+                    </ul>
+                </nav>
+            </div>
+        </div>
+
+        <!-- Main Content Area -->
+        <main class="pf-v6-c-page__main" id="main-content" tabindex="-1">
+            <!-- Flash Messages -->
+            <div id="flash-messages">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                    <div class="pf-v6-c-alert pf-m-{{ 'danger' if category == 'error' else category }} pf-m-inline pf-v6-u-m-md">
+                        <div class="pf-v6-c-alert__icon">
+                            <i class="fas fa-{{ 'exclamation-circle' if category in ['danger', 'error'] else 'check-circle' if category == 'success' else 'info-circle' if category == 'info' else 'exclamation-triangle' }}"></i>
+                        </div>
+                        <p class="pf-v6-c-alert__title">{{ message }}</p>
+                        <div class="pf-v6-c-alert__action">
+                            <button class="pf-v6-c-button pf-m-plain" type="button" aria-label="Close" onclick="this.closest('.pf-v6-c-alert').remove()">
+                                <i class="fas fa-times"></i>
+                            </button>
+                        </div>
+                    </div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
+            </div>
+
+            <!-- Page Content Section -->
+            <section class="pf-v6-c-page__main-section pf-v6-u-p-xl">
+                {% block content %}{% endblock %}
+            </section>
+        </main>
+    </div>
+
+    <!-- JavaScript -->
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+
+    <script>
+    // Mobile nav toggle with persistence
+    const navToggle = document.getElementById('nav-toggle');
+    if (navToggle) {
+        navToggle.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            const sidebar = document.getElementById('page-sidebar');
+            const page = document.querySelector('.pf-v6-c-page');
+            if (sidebar) {
+                const isCurrentlyExpanded = sidebar.classList.contains('pf-m-expanded');
+                if (isCurrentlyExpanded) {
+                    sidebar.classList.remove('pf-m-expanded');
+                    if (page) page.classList.remove('pf-m-sidebar-expanded');
+                    localStorage.setItem('cgroupsv2_sidebar_expanded', 'false');
+                } else {
+                    sidebar.classList.add('pf-m-expanded');
+                    if (page) page.classList.add('pf-m-sidebar-expanded');
+                    localStorage.setItem('cgroupsv2_sidebar_expanded', 'true');
+                }
+            }
+        });
+    }
+
+    // Initialize sidebar state - expanded by default
+    document.addEventListener('DOMContentLoaded', function() {
+        const sidebar = document.getElementById('page-sidebar');
+        const page = document.querySelector('.pf-v6-c-page');
+        const savedState = localStorage.getItem('cgroupsv2_sidebar_expanded');
+        if (savedState === 'false') {
+            sidebar?.classList.remove('pf-m-expanded');
+            if (page) page.classList.remove('pf-m-sidebar-expanded');
+        }
+
+        // Auto-dismiss flash messages after 8 seconds
+        const flashMessages = document.querySelectorAll('#flash-messages .pf-v6-c-alert');
+        flashMessages.forEach(function(alert) {
+            setTimeout(function() {
+                alert.style.opacity = '0';
+                alert.style.transition = 'opacity 0.3s ease';
+                setTimeout(() => alert.remove(), 300);
+            }, 8000);
+        });
+    });
+    </script>
+
+    {% block extra_scripts %}{% endblock %}
+</body>
+</html>
