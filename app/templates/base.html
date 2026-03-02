@@ -63,6 +63,12 @@
                                 Home
                             </a>
                         </li>
+                        <!-- Registries -->
+                        <li class="pf-v6-c-nav__item">
+                            <a class="pf-v6-c-nav__link{% if request.path == '/registries' %} pf-m-current{% endif %}" href="/registries">
+                                Registries
+                            </a>
+                        </li>
                     </ul>
                 </nav>
             </div>
@@ -100,6 +106,44 @@
 
     <!-- JavaScript -->
     <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+
+    <!-- Inline flash message system -->
+    <script>
+    function _flashEscapeHtml(text) {
+        if (!text) return '';
+        var div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+    function showFlashMessage(message, category) {
+        var container = document.getElementById('flash-messages');
+        if (!container) return;
+        var iconMap = {
+            danger: 'exclamation-circle',
+            error: 'exclamation-circle',
+            success: 'check-circle',
+            info: 'info-circle',
+            warning: 'exclamation-triangle'
+        };
+        var alertClass = category === 'error' ? 'danger' : category;
+        var icon = iconMap[category] || 'info-circle';
+        var el = document.createElement('div');
+        el.className = 'pf-v6-c-alert pf-m-' + alertClass + ' pf-m-inline pf-v6-u-m-md';
+        el.setAttribute('role', 'alert');
+        el.innerHTML =
+            '<div class="pf-v6-c-alert__icon"><i class="fas fa-' + icon + '"></i></div>' +
+            '<p class="pf-v6-c-alert__title">' + _flashEscapeHtml(message) + '</p>' +
+            '<div class="pf-v6-c-alert__action">' +
+                '<button class="pf-v6-c-button pf-m-plain" type="button" aria-label="Close" onclick="this.closest(\'.pf-v6-c-alert\').remove()">' +
+                    '<i class="fas fa-times"></i></button></div>';
+        container.appendChild(el);
+        setTimeout(function() {
+            el.style.opacity = '0';
+            el.style.transition = 'opacity 0.3s ease';
+            setTimeout(function() { el.remove(); }, 300);
+        }, 8000);
+    }
+    </script>
 
     <script>
     // Mobile nav toggle with persistence

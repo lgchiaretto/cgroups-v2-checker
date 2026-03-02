@@ -20,7 +20,7 @@ class Config:
     # Skopeo settings
     SKOPEO_TLS_VERIFY = os.environ.get("SKOPEO_TLS_VERIFY", "true").lower() == "true"
     SKOPEO_AUTH_FILE = os.environ.get("SKOPEO_AUTH_FILE", "")
-    SKOPEO_MAX_WORKERS = int(os.environ.get("SKOPEO_MAX_WORKERS", "10"))
+    SKOPEO_MAX_WORKERS = int(os.environ.get("SKOPEO_MAX_WORKERS", "20"))
 
     # Registry authentication
     # When enabled, reads ImagePullSecrets from pods/ServiceAccounts

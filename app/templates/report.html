@@ -2,6 +2,8 @@
 {% block title %}Report {{ report_id }} - cgroups v2 Checker{% endblock %}
 
 {% block content %}
+{% set sev_colors = {"CRITICAL": "red", "HIGH": "orange", "MEDIUM": "gold", "LOW": "blue", "OK": "green"} %}
+
 <!-- Header -->
 <div class="pf-v6-l-flex pf-m-justify-content-space-between pf-m-align-items-center pf-v6-u-mb-lg">
   <div>
@@ -13,7 +15,10 @@
       {% endif %}
     </p>
   </div>
-  <div>
+  <div class="pf-v6-l-flex pf-m-gap-sm">
+    <a href="/reports/{{ report_id }}/csv" class="pf-v6-c-button pf-m-primary" id="btn-download-csv">
+      <i class="fas fa-file-csv pf-v6-u-mr-sm"></i> Download CSV
+    </a>
     <a href="/reports/{{ report_id }}/download" class="pf-v6-c-button pf-m-secondary">
       <i class="fas fa-download pf-v6-u-mr-sm"></i> Download JSON
     </a>
@@ -23,24 +28,35 @@
   </div>
 </div>
 
-  <!-- Summary cards -->
+  <!-- Summary cards (clickable — clicking filters the table by severity) -->
   <div class="pf-v6-l-gallery pf-m-gutter pf-v6-u-mb-lg" style="--pf-v6-l-gallery--GridTemplateColumns--min: 160px;">
-    <div class="pf-v6-c-card">
+    <div class="pf-v6-c-card summary-card summary-card--clickable" data-filter-severity="" title="Show all images">
       <div class="pf-v6-c-card__body">
         <div class="pf-v6-u-font-size-3xl pf-v6-u-font-weight-bold">{{ report.total_images }}</div>
         <div class="pf-v6-u-color-200">Total images</div>
       </div>
     </div>
-    <div class="pf-v6-c-card">
+    <div class="pf-v6-c-card summary-card summary-card--clickable" data-filter-inspected="true" title="Show images inspected via skopeo">
       <div class="pf-v6-c-card__body">
         <div class="pf-v6-u-font-size-3xl pf-v6-u-font-weight-bold">{{ report.inspected_via_skopeo }}</div>
-        <div class="pf-v6-u-color-200">Inspected via skopeo</div>
+        <div class="pf-v6-u-color-200"><i class="fas fa-check-circle pf-v6-u-mr-xs"></i> Inspected</div>
       </div>
     </div>
-    {% set sev_colors = {"CRITICAL": "red", "HIGH": "orange", "MEDIUM": "gold", "LOW": "blue", "OK": "green"} %}
+    <div class="pf-v6-c-card summary-card summary-card--clickable" data-filter-uninspected="true" title="Show images that failed inspection">
+      <div class="pf-v6-c-card__body">
+        <div class="pf-v6-u-font-size-3xl pf-v6-u-font-weight-bold">
+          {% if report.skopeo_errors|default(0) > 0 %}
+          <span class="pf-v6-c-label pf-m-orange"><span class="pf-v6-c-label__content">{{ report.skopeo_errors }}</span></span>
+          {% else %}
+          {{ report.skopeo_errors|default(0) }}
+          {% endif %}
+        </div>
+        <div class="pf-v6-u-color-200"><i class="fas fa-exclamation-triangle pf-v6-u-mr-xs"></i> Not Inspected</div>
+      </div>
+    </div>
     {% for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "OK"] %}
     {% set count = report.by_severity.get(sev, 0) %}
-    <div class="pf-v6-c-card">
+    <div class="pf-v6-c-card summary-card summary-card--clickable" data-filter-severity="{{ sev }}" title="Filter by {{ sev }}">
       <div class="pf-v6-c-card__body">
         <div class="pf-v6-u-font-size-3xl pf-v6-u-font-weight-bold">
           {% if count > 0 and sev != "OK" %}
@@ -93,12 +109,39 @@
           </button>
           {% endfor %}
         </div>
+        <button class="pf-v6-c-button pf-m-link pf-m-small" id="btn-clear-filters" title="Clear all filters" style="display:none;">
+          <i class="fas fa-times pf-v6-u-mr-xs"></i> Clear filters
+        </button>
       </div>
     </div>
   </div>
 
   <!-- Images table -->
   <div class="pf-v6-c-card">
+    <!-- Pagination (top) -->
+    <div class="pagination-container" id="pagination-top">
+      <div class="pagination-per-page">
+        <span class="pagination-text">Items per page</span>
+        <select class="pagination-input" id="per-page-select" onchange="changePerPage(this.value)">
+          <option value="20" selected>20</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="0">All</option>
+        </select>
+      </div>
+      <div class="pagination-total">
+        <span id="pagination-range">1 - 20</span> of <span id="pagination-total">0</span> items
+      </div>
+      <div class="pagination-nav">
+        <button class="pagination-btn" title="First page" onclick="goToPage(1)" id="pg-first"><i class="fas fa-angle-double-left"></i></button>
+        <button class="pagination-btn" title="Previous page" onclick="goToPage(currentPage - 1)" id="pg-prev"><i class="fas fa-angle-left"></i></button>
+        <input class="pagination-page-input" type="number" min="1" id="pg-input" value="1" onchange="goToPage(parseInt(this.value) || 1)">
+        <span class="pagination-text" id="pg-of">of 1</span>
+        <button class="pagination-btn" title="Next page" onclick="goToPage(currentPage + 1)" id="pg-next"><i class="fas fa-angle-right"></i></button>
+        <button class="pagination-btn" title="Last page" onclick="goToPage(totalPages)" id="pg-last"><i class="fas fa-angle-double-right"></i></button>
+      </div>
+    </div>
+
     <div class="pf-v6-c-card__body">
       <table class="pf-v6-c-table pf-m-grid-md pf-m-compact" role="grid" id="images-table">
         <thead>
@@ -113,13 +156,19 @@
         </thead>
         <tbody>
           {% for img in report.images %}
-          <tr role="row" class="image-row" data-severity="{{ img.max_severity }}" data-image="{{ img.image | lower }}">
+          <tr role="row" class="image-row" data-severity="{{ img.max_severity }}" data-image="{{ img.image | lower }}"
+              data-inspected="{{ 'true' if img.inspected else 'false' }}"
+              data-inspection-error="{{ 'true' if img.inspection_error else 'false' }}"
+              data-pods='{{ img.pods | tojson }}' data-namespaces='{{ img.namespaces | tojson }}'
+              data-containers='{{ img.containers | tojson }}' data-init-containers='{{ img.init_containers | tojson }}'>
             <td role="cell" data-label="Severity">
               {% set s = img.max_severity %}
               <span class="pf-v6-c-label pf-m-{{ sev_colors.get(s, 'blue') }}"><span class="pf-v6-c-label__content">{{ s }}</span></span>
             </td>
             <td role="cell" data-label="Image" class="pf-v6-u-text-break-word" style="max-width: 420px;">
-              <code>{{ img.image }}</code>
+              <button class="pf-v6-c-button pf-m-link pf-m-inline btn-drilldown-image" title="Click for pod details">
+                <code>{{ img.image }}</code>
+              </button>
             </td>
             <td role="cell" data-label="Pods">{{ img.pod_count }}</td>
             <td role="cell" data-label="Namespaces">
@@ -174,33 +223,160 @@
         </tbody>
       </table>
     </div>
+
+    <!-- Pagination (bottom) -->
+    <div class="pagination-container" id="pagination-bottom">
+      <div class="pagination-per-page">
+        <span class="pagination-text">Items per page</span>
+        <select class="pagination-input" id="per-page-select-bottom" onchange="changePerPage(this.value)">
+          <option value="20" selected>20</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="0">All</option>
+        </select>
+      </div>
+      <div class="pagination-total">
+        <span id="pagination-range-bottom">1 - 20</span> of <span id="pagination-total-bottom">0</span> items
+      </div>
+      <div class="pagination-nav">
+        <button class="pagination-btn" title="First page" onclick="goToPage(1)"><i class="fas fa-angle-double-left"></i></button>
+        <button class="pagination-btn" title="Previous page" onclick="goToPage(currentPage - 1)"><i class="fas fa-angle-left"></i></button>
+        <input class="pagination-page-input" type="number" min="1" id="pg-input-bottom" value="1" onchange="goToPage(parseInt(this.value) || 1)">
+        <span class="pagination-text" id="pg-of-bottom">of 1</span>
+        <button class="pagination-btn" title="Next page" onclick="goToPage(currentPage + 1)"><i class="fas fa-angle-right"></i></button>
+        <button class="pagination-btn" title="Last page" onclick="goToPage(totalPages)"><i class="fas fa-angle-double-right"></i></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Image drilldown modal -->
+  <div class="pf-v6-c-backdrop" id="drilldown-backdrop" style="display:none;">
+    <div class="pf-v6-c-modal-box pf-m-lg" role="dialog" aria-modal="true" aria-labelledby="drilldown-title">
+      <div class="pf-v6-c-modal-box__close">
+        <button class="pf-v6-c-button pf-m-plain" type="button" aria-label="Close" id="drilldown-close">
+          <i class="fas fa-times"></i>
+        </button>
+      </div>
+      <header class="pf-v6-c-modal-box__header">
+        <h1 class="pf-v6-c-modal-box__title" id="drilldown-title">Image Details</h1>
+        <div class="pf-v6-u-color-200 pf-v6-u-mt-xs" id="drilldown-subtitle"></div>
+      </header>
+      <div class="pf-v6-c-modal-box__body" id="drilldown-body"></div>
+      <footer class="pf-v6-c-modal-box__footer">
+        <button class="pf-v6-c-button pf-m-primary" type="button" id="drilldown-close-btn">Close</button>
+      </footer>
+    </div>
   </div>
 {% endblock %}
 
 {% block extra_scripts %}
 <script>
+var currentPage = 1;
+var totalPages = 1;
+var perPage = 20;
+
+function goToPage(page) {
+  if (page < 1) page = 1;
+  if (page > totalPages) page = totalPages;
+  currentPage = page;
+  applyPagination();
+}
+
+function changePerPage(val) {
+  perPage = parseInt(val) || 0;
+  currentPage = 1;
+  // Sync both selects
+  document.getElementById("per-page-select").value = val;
+  document.getElementById("per-page-select-bottom").value = val;
+  applyPagination();
+}
+
+function applyPagination() {
+  var rows = [];
+  document.querySelectorAll(".image-row").forEach(function(row) {
+    if (row.dataset.filtered !== "true") {
+      rows.push(row);
+    }
+  });
+
+  var total = rows.length;
+  var start, end;
+
+  if (perPage === 0 || perPage >= total) {
+    // Show all
+    totalPages = 1;
+    currentPage = 1;
+    start = 0;
+    end = total;
+  } else {
+    totalPages = Math.ceil(total / perPage);
+    if (currentPage > totalPages) currentPage = totalPages;
+    if (currentPage < 1) currentPage = 1;
+    start = (currentPage - 1) * perPage;
+    end = Math.min(start + perPage, total);
+  }
+
+  // Show/hide rows
+  rows.forEach(function(row, idx) {
+    var show = (idx >= start && idx < end);
+    row.style.display = show ? "" : "none";
+    var next = row.nextElementSibling;
+    if (next && next.classList.contains("findings-row") && !show) {
+      next.style.display = "none";
+    }
+  });
+
+  // Update controls
+  var rangeText = total === 0 ? "0" : (start + 1) + " - " + end;
+  document.getElementById("pagination-range").textContent = rangeText;
+  document.getElementById("pagination-total").textContent = total;
+  document.getElementById("pagination-range-bottom").textContent = rangeText;
+  document.getElementById("pagination-total-bottom").textContent = total;
+  document.getElementById("pg-input").value = currentPage;
+  document.getElementById("pg-input").max = totalPages;
+  document.getElementById("pg-input-bottom").value = currentPage;
+  document.getElementById("pg-input-bottom").max = totalPages;
+  document.getElementById("pg-of").textContent = "of " + totalPages;
+  document.getElementById("pg-of-bottom").textContent = "of " + totalPages;
+
+  // Enable/disable nav buttons
+  var isFirst = currentPage <= 1;
+  var isLast = currentPage >= totalPages;
+  document.getElementById("pg-first").disabled = isFirst;
+  document.getElementById("pg-prev").disabled = isFirst;
+  document.getElementById("pg-next").disabled = isLast;
+  document.getElementById("pg-last").disabled = isLast;
+}
+
 document.addEventListener("DOMContentLoaded", function() {
-  // Toggle findings rows
+  var reportId = "{{ report_id }}";
+  var activeFilters = new Set();
+  var filterInspected = false;
+  var filterUninspected = false;
+  var filterInput = document.getElementById("filter-text");
+  var clearBtn = document.getElementById("btn-clear-filters");
+  var csvBtn = document.getElementById("btn-download-csv");
+
+  // ── Toggle findings rows ──
   document.querySelectorAll(".btn-toggle-findings").forEach(function(btn) {
-    btn.addEventListener("click", function() {
-      const row = btn.closest("tr").nextElementSibling;
+    btn.addEventListener("click", function(e) {
+      e.stopPropagation();
+      var row = btn.closest("tr").nextElementSibling;
       if (row && row.classList.contains("findings-row")) {
-        const visible = row.style.display !== "none";
+        var visible = row.style.display !== "none";
         row.style.display = visible ? "none" : "";
         btn.querySelector("i").className = visible ? "fas fa-chevron-down pf-v6-u-ml-xs" : "fas fa-chevron-up pf-v6-u-ml-xs";
       }
     });
   });
 
-  // Text filter
-  const filterInput = document.getElementById("filter-text");
+  // ── Text filter ──
   filterInput.addEventListener("input", applyFilters);
 
-  // Severity filters
-  const activeFilters = new Set();
+  // ── Severity filter buttons ──
   document.querySelectorAll(".severity-filter").forEach(function(btn) {
     btn.addEventListener("click", function() {
-      const sev = btn.dataset.severity;
+      var sev = btn.dataset.severity;
       if (activeFilters.has(sev)) {
         activeFilters.delete(sev);
         btn.classList.add("pf-m-outline");
@@ -208,25 +384,246 @@ document.addEventListener("DOMContentLoaded", function() {
         activeFilters.add(sev);
         btn.classList.remove("pf-m-outline");
       }
+      syncCardHighlights();
       applyFilters();
     });
   });
 
-  function applyFilters() {
-    const text = filterInput.value.toLowerCase();
-    document.querySelectorAll(".image-row").forEach(function(row) {
-      const img = row.dataset.image;
-      const sev = row.dataset.severity;
-      const textMatch = !text || img.includes(text);
-      const sevMatch = activeFilters.size === 0 || activeFilters.has(sev);
-      row.style.display = (textMatch && sevMatch) ? "" : "none";
-      // Also hide findings row
-      const next = row.nextElementSibling;
-      if (next && next.classList.contains("findings-row") && row.style.display === "none") {
-        next.style.display = "none";
+  // ── Clickable summary cards ──
+  document.querySelectorAll(".summary-card--clickable").forEach(function(card) {
+    card.addEventListener("click", function() {
+      var sev = card.dataset.filterSeverity;
+      var inspected = card.dataset.filterInspected;
+      var uninspected = card.dataset.filterUninspected;
+
+      if (uninspected === "true") {
+        filterUninspected = !filterUninspected;
+        card.classList.toggle("summary-card--active", filterUninspected);
+        if (filterUninspected) {
+          filterInspected = false;
+          var inspCard = document.querySelector('[data-filter-inspected="true"]');
+          if (inspCard) inspCard.classList.remove("summary-card--active");
+          activeFilters.clear();
+          document.querySelectorAll(".severity-filter").forEach(function(b) { b.classList.add("pf-m-outline"); });
+          syncCardHighlights();
+        }
+        applyFilters();
+        return;
+      }
+
+      if (inspected === "true") {
+        filterInspected = !filterInspected;
+        card.classList.toggle("summary-card--active", filterInspected);
+        if (filterInspected) {
+          filterUninspected = false;
+          var unCard = document.querySelector('[data-filter-uninspected="true"]');
+          if (unCard) unCard.classList.remove("summary-card--active");
+          activeFilters.clear();
+          document.querySelectorAll(".severity-filter").forEach(function(b) { b.classList.add("pf-m-outline"); });
+          syncCardHighlights();
+        }
+        applyFilters();
+        return;
+      }
+
+      // Reset inspected/uninspected filters when clicking severity/total cards
+      filterInspected = false;
+      filterUninspected = false;
+      var inspectedCard = document.querySelector('[data-filter-inspected="true"]');
+      if (inspectedCard) inspectedCard.classList.remove("summary-card--active");
+      var uninspectedCard = document.querySelector('[data-filter-uninspected="true"]');
+      if (uninspectedCard) uninspectedCard.classList.remove("summary-card--active");
+
+      if (sev === "") {
+        // "Total" card — clear all severity filters
+        activeFilters.clear();
+        document.querySelectorAll(".severity-filter").forEach(function(b) { b.classList.add("pf-m-outline"); });
+      } else {
+        // Toggle this single severity as exclusive
+        activeFilters.clear();
+        document.querySelectorAll(".severity-filter").forEach(function(b) { b.classList.add("pf-m-outline"); });
+        activeFilters.add(sev);
+        var matchBtn = document.querySelector('.severity-filter[data-severity="' + sev + '"]');
+        if (matchBtn) matchBtn.classList.remove("pf-m-outline");
+      }
+      syncCardHighlights();
+      applyFilters();
+    });
+  });
+
+  // ── Clear filters ──
+  clearBtn.addEventListener("click", function() {
+    activeFilters.clear();
+    filterInspected = false;
+    filterUninspected = false;
+    filterInput.value = "";
+    document.querySelectorAll(".severity-filter").forEach(function(b) { b.classList.add("pf-m-outline"); });
+    var inspectedCard = document.querySelector('[data-filter-inspected="true"]');
+    if (inspectedCard) inspectedCard.classList.remove("summary-card--active");
+    var uninspectedCard = document.querySelector('[data-filter-uninspected="true"]');
+    if (uninspectedCard) uninspectedCard.classList.remove("summary-card--active");
+    syncCardHighlights();
+    applyFilters();
+  });
+
+  // Initialize pagination on load
+  applyFilters();
+
+  function syncCardHighlights() {
+    document.querySelectorAll(".summary-card--clickable").forEach(function(card) {
+      var sev = card.dataset.filterSeverity;
+      if (activeFilters.size === 0) {
+        card.classList.remove("summary-card--active");
+      } else if (sev === "") {
+        card.classList.remove("summary-card--active");
+      } else {
+        card.classList.toggle("summary-card--active", activeFilters.has(sev));
       }
     });
   }
+
+  function applyFilters() {
+    var text = filterInput.value.toLowerCase();
+    var hasFilter = text || activeFilters.size > 0 || filterInspected || filterUninspected;
+    clearBtn.style.display = hasFilter ? "" : "none";
+
+    // Update CSV download link to include current severity filter
+    var csvUrl = "/reports/" + reportId + "/csv";
+    if (activeFilters.size > 0) {
+      csvUrl += "?severity=" + Array.from(activeFilters).join(",");
+    }
+    csvBtn.href = csvUrl;
+
+    document.querySelectorAll(".image-row").forEach(function(row) {
+      var img = row.dataset.image;
+      var sev = row.dataset.severity;
+      var inspected = row.dataset.inspected;
+      var inspError = row.dataset.inspectionError;
+      var textMatch = !text || img.includes(text);
+      var sevMatch = activeFilters.size === 0 || activeFilters.has(sev);
+      var inspMatch = !filterInspected || inspected === "true";
+      var uninspMatch = !filterUninspected || inspError === "true";
+      var visible = textMatch && sevMatch && inspMatch && uninspMatch;
+      row.dataset.filtered = visible ? "false" : "true";
+      var next = row.nextElementSibling;
+      if (next && next.classList.contains("findings-row") && !visible) {
+        next.style.display = "none";
+      }
+    });
+
+    // Reset to page 1 when filters change, then paginate
+    currentPage = 1;
+    applyPagination();
+  }
+
+  // ── Image drilldown modal ──
+  var backdrop = document.getElementById("drilldown-backdrop");
+  var drilldownBody = document.getElementById("drilldown-body");
+  var drilldownSubtitle = document.getElementById("drilldown-subtitle");
+
+  function openDrilldown(row) {
+    var image = row.querySelector("code").textContent;
+    var severity = row.dataset.severity;
+    var pods = JSON.parse(row.dataset.pods || "[]");
+    var namespaces = JSON.parse(row.dataset.namespaces || "[]");
+    var containers = JSON.parse(row.dataset.containers || "[]");
+    var initContainers = JSON.parse(row.dataset.initContainers || "[]");
+
+    document.getElementById("drilldown-title").textContent = image;
+    drilldownSubtitle.innerHTML = '<span class="pf-v6-c-label pf-m-' + severityColor(severity) + '"><span class="pf-v6-c-label__content">' + severity + '</span></span> &mdash; ' + pods.length + ' pod(s) across ' + namespaces.length + ' namespace(s)';
+
+    var html = '';
+
+    // Pod list grouped by namespace
+    var nsPods = {};
+    pods.forEach(function(p) {
+      var parts = p.split("/");
+      var ns = parts[0];
+      var name = parts.slice(1).join("/");
+      if (!nsPods[ns]) nsPods[ns] = [];
+      nsPods[ns].push(name);
+    });
+
+    html += '<h3 class="pf-v6-c-title pf-m-lg pf-v6-u-mb-sm"><i class="fas fa-cubes pf-v6-u-mr-sm"></i>Pods by Namespace</h3>';
+    html += '<div class="pf-v6-c-accordion">';
+    Object.keys(nsPods).sort().forEach(function(ns) {
+      var podList = nsPods[ns].sort();
+      html += '<div class="pf-v6-c-accordion__toggle-wrapper">';
+      html += '<button class="pf-v6-c-accordion__toggle drilldown-ns-toggle" type="button">';
+      html += '<span class="pf-v6-c-accordion__toggle-text"><span class="pf-v6-c-label pf-m-compact pf-v6-u-mr-xs"><span class="pf-v6-c-label__content">' + ns + '</span></span> (' + podList.length + ' pods)</span>';
+      html += '<span class="pf-v6-c-accordion__toggle-icon"><i class="fas fa-angle-right"></i></span>';
+      html += '</button>';
+      html += '</div>';
+      html += '<div class="pf-v6-c-accordion__expanded-content" style="display:none;">';
+      html += '<div class="pf-v6-c-accordion__expanded-content-body">';
+      html += '<table class="pf-v6-c-table pf-m-compact pf-m-grid-md"><thead><tr><th>Pod</th></tr></thead><tbody>';
+      podList.forEach(function(pod) {
+        html += '<tr><td><code>' + pod + '</code></td></tr>';
+      });
+      html += '</tbody></table>';
+      html += '</div></div>';
+    });
+    html += '</div>';
+
+    // Containers
+    if (containers.length > 0) {
+      html += '<h3 class="pf-v6-c-title pf-m-lg pf-v6-u-mt-lg pf-v6-u-mb-sm"><i class="fas fa-box pf-v6-u-mr-sm"></i>Containers</h3>';
+      html += '<div class="pf-v6-l-flex pf-m-gap-sm pf-m-wrap">';
+      containers.forEach(function(c) {
+        html += '<span class="pf-v6-c-label pf-m-compact"><span class="pf-v6-c-label__content">' + c + '</span></span>';
+      });
+      html += '</div>';
+    }
+    if (initContainers.length > 0) {
+      html += '<h3 class="pf-v6-c-title pf-m-lg pf-v6-u-mt-lg pf-v6-u-mb-sm"><i class="fas fa-box-open pf-v6-u-mr-sm"></i>Init Containers</h3>';
+      html += '<div class="pf-v6-l-flex pf-m-gap-sm pf-m-wrap">';
+      initContainers.forEach(function(c) {
+        html += '<span class="pf-v6-c-label pf-m-compact"><span class="pf-v6-c-label__content">' + c + '</span></span>';
+      });
+      html += '</div>';
+    }
+
+    drilldownBody.innerHTML = html;
+
+    // Accordion toggles
+    drilldownBody.querySelectorAll(".drilldown-ns-toggle").forEach(function(btn) {
+      btn.addEventListener("click", function() {
+        var content = btn.closest(".pf-v6-c-accordion__toggle-wrapper").nextElementSibling;
+        var open = content.style.display !== "none";
+        content.style.display = open ? "none" : "";
+        btn.querySelector(".pf-v6-c-accordion__toggle-icon i").className = open ? "fas fa-angle-right" : "fas fa-angle-down";
+      });
+    });
+
+    backdrop.style.display = "";
+    document.body.style.overflow = "hidden";
+  }
+
+  function closeDrilldown() {
+    backdrop.style.display = "none";
+    document.body.style.overflow = "";
+  }
+
+  function severityColor(sev) {
+    var map = {"CRITICAL": "red", "HIGH": "orange", "MEDIUM": "gold", "LOW": "blue", "OK": "green"};
+    return map[sev] || "blue";
+  }
+
+  document.querySelectorAll(".btn-drilldown-image").forEach(function(btn) {
+    btn.addEventListener("click", function(e) {
+      e.stopPropagation();
+      openDrilldown(btn.closest("tr"));
+    });
+  });
+
+  document.getElementById("drilldown-close").addEventListener("click", closeDrilldown);
+  document.getElementById("drilldown-close-btn").addEventListener("click", closeDrilldown);
+  backdrop.addEventListener("click", function(e) {
+    if (e.target === backdrop) closeDrilldown();
+  });
+  document.addEventListener("keydown", function(e) {
+    if (e.key === "Escape" && backdrop.style.display !== "none") closeDrilldown();
+  });
 });
 </script>
 {% endblock %}

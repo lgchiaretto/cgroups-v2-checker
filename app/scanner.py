@@ -227,7 +227,7 @@ class CGroupsV2Scanner:
         inspect_images: bool = True,
         skopeo_tls_verify: bool = True,
         skopeo_auth_file: str = "",
-        max_workers: int = 10,
+        max_workers: int = 20,
         progress_callback=None,
         use_image_pull_secrets: bool = True,
     ):
@@ -489,14 +489,18 @@ class CGroupsV2Scanner:
 
         total_pods = 0
         skipped = 0
+        skipped_excluded = 0
+        skipped_system = 0
 
         for pod in all_pods:
             ns = pod.metadata.namespace
             if ns in self.exclude_namespaces:
                 skipped += 1
+                skipped_excluded += 1
                 continue
             if self.skip_system_ns and ns in OPENSHIFT_SYSTEM_NS:
                 skipped += 1
+                skipped_system += 1
                 continue
 
             total_pods += 1
@@ -537,7 +541,15 @@ class CGroupsV2Scanner:
                 report.only_in_init = True
 
         self.cluster_info["total_pods_scanned"] = str(total_pods)
-        self.cluster_info["pods_skipped"] = str(skipped)
+        skip_parts = []
+        if skipped_system > 0:
+            skip_parts.append(f"system namespaces: {skipped_system}")
+        if skipped_excluded > 0:
+            skip_parts.append(f"excluded namespaces: {skipped_excluded}")
+        if skip_parts:
+            self.cluster_info["pods_skipped"] = f"{skipped} ({', '.join(skip_parts)})"
+        else:
+            self.cluster_info["pods_skipped"] = str(skipped)
         self.cluster_info["unique_images"] = str(len(self.image_reports))
         self.cluster_info["registry_credentials"] = str(len(self._registry_auths))
 
@@ -727,10 +739,19 @@ class CGroupsV2Scanner:
         if self._sa_token and self._internal_registry and self._internal_registry in image:
             cmd.extend(["--creds", f"serviceaccount:{self._sa_token}"])
 
-        # Normalize digest references for skopeo
+        # Normalize image reference for skopeo.
+        # Images with both tag and digest (e.g. image:v4.18@sha256:abc) cause
+        # "Error parsing image name" because skopeo cannot handle that format.
+        # Strip the tag portion, keeping only the digest which is the precise ref.
         skopeo_ref = image
-        if "@sha256:" in image:
-            skopeo_ref = image
+        if "@sha256:" in skopeo_ref:
+            # Split at @, then remove the tag from the name part (before @)
+            name_part, digest_part = skopeo_ref.split("@", 1)
+            # name_part might be "registry/repo:tag" — strip the tag
+            if ":" in name_part:
+                # Only strip if it looks like a tag (after the last colon in the path)
+                base = name_part.rsplit(":", 1)[0]
+                skopeo_ref = f"{base}@{digest_part}"
         cmd.append(f"docker://{skopeo_ref}")
 
         try:
@@ -896,6 +917,7 @@ class CGroupsV2Scanner:
             "total_images": len(self.image_reports),
             "init_only_images": init_only,
             "inspected_via_skopeo": sum(1 for r in self.image_reports.values() if r.inspected),
+            "skopeo_errors": sum(1 for r in self.image_reports.values() if r.inspection_error),
             "skopeo_cache_size": len(_skopeo_cache),
             "by_severity": dict(by_severity),
         }

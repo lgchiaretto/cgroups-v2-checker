@@ -53,8 +53,10 @@ document.addEventListener("DOMContentLoaded", function () {
       .then(function (data) {
         if (data.error) {
           showProgressError(data.error);
+          if (typeof showFlashMessage === 'function') showFlashMessage(data.error, 'danger');
           return;
         }
+        if (typeof showFlashMessage === 'function') showFlashMessage('Scan started. Monitoring progress...', 'info');
         pollScanProgress(data.scan_id);
       })
       .catch(function (err) {
@@ -63,21 +65,71 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   function pollScanProgress(scanId) {
-    const interval = setInterval(function () {
+    var errorCount = 0;
+    var maxErrors = 40; // ~60 seconds of 404s before checking for completed report
+    var startTime = Date.now();
+
+    var interval = setInterval(function () {
       fetch("/api/scan/" + scanId)
-        .then(function (res) { return res.json(); })
+        .then(function (res) {
+          if (res.status === 404) {
+            errorCount++;
+            // Show informational message after a few retries
+            if (errorCount >= 3) {
+              document.getElementById("scan-progress-detail").textContent =
+                "Waiting for scan state... (attempt " + errorCount + "/" + maxErrors + ")";
+            }
+            // After many 404s, check if scan completed but state was lost
+            if (errorCount >= maxErrors) {
+              clearInterval(interval);
+              checkForCompletedReport(scanId);
+            }
+            return null;
+          }
+          errorCount = 0; // reset counter on success
+          return res.json();
+        })
         .then(function (data) {
+          if (!data) return;
+          // Attach elapsed seconds for the UI
+          data._elapsed = Math.round((Date.now() - startTime) / 1000);
           updateProgressUI(data);
           if (data.status === "completed") {
             clearInterval(interval);
-            setTimeout(function () { window.location.reload(); }, 1000);
+            if (typeof showFlashMessage === 'function') showFlashMessage('Scan completed successfully!', 'success');
+            setTimeout(function () { window.location.reload(); }, 1500);
           } else if (data.status === "failed") {
             clearInterval(interval);
+            if (typeof showFlashMessage === 'function') showFlashMessage(data.error || 'Scan failed.', 'danger');
             showProgressError(data.error || "Scan failed.");
           }
         })
-        .catch(function () { /* retry on next poll */ });
+        .catch(function () {
+          errorCount++;
+          if (errorCount >= maxErrors) {
+            clearInterval(interval);
+            checkForCompletedReport(scanId);
+          }
+        });
     }, 1500);
+  }
+
+  function checkForCompletedReport(scanId) {
+    // The scan may have completed but the polling state was lost (e.g. pod restart).
+    // Check if a report was saved with this scan ID.
+    fetch("/api/reports/" + scanId)
+      .then(function (res) {
+        if (res.status === 200) {
+          window.location.href = "/reports/" + scanId;
+        } else {
+          showProgressError("Lost connection to scan. Check the reports list or try again.");
+          setTimeout(function () { window.location.reload(); }, 3000);
+        }
+      })
+      .catch(function () {
+        showProgressError("Lost connection to scan. Check the reports list or try again.");
+        setTimeout(function () { window.location.reload(); }, 3000);
+      });
   }
 
   function updateProgressUI(data) {
@@ -95,6 +147,15 @@ document.addEventListener("DOMContentLoaded", function () {
     };
 
     var title = stageLabels[data.stage] || data.stage;
+
+    // Append elapsed time
+    if (data._elapsed && data.status !== "completed") {
+      var mins = Math.floor(data._elapsed / 60);
+      var secs = data._elapsed % 60;
+      var timeStr = mins > 0 ? mins + "m " + secs + "s" : secs + "s";
+      title += " (" + timeStr + ")";
+    }
+
     document.getElementById("scan-progress-title").textContent = title;
     document.getElementById("scan-progress-detail").textContent = data.detail || "";
     document.getElementById("scan-progress-pct").textContent = pct + "%";
@@ -119,8 +180,13 @@ document.addEventListener("DOMContentLoaded", function () {
       if (!confirm("Delete report " + id + "?")) return;
       fetch("/api/reports/" + id, { method: "DELETE" })
         .then(function (res) { return res.json(); })
-        .then(function () { window.location.reload(); })
-        .catch(function (err) { alert("Delete failed: " + err.message); });
+        .then(function () {
+          if (typeof showFlashMessage === 'function') showFlashMessage('Report deleted.', 'success');
+          setTimeout(function () { window.location.reload(); }, 500);
+        })
+        .catch(function (err) {
+          if (typeof showFlashMessage === 'function') showFlashMessage('Delete failed: ' + err.message, 'danger');
+        });
     });
   });
 });
