@@ -757,12 +757,45 @@ class CGroupsV2Scanner:
                 except Exception as e:
                     self.image_reports[img].inspection_error = str(e)
 
+    @staticmethod
+    def _parse_skopeo_error(stderr: str, image: str) -> str:
+        """Extract a meaningful error from skopeo's stderr output.
+
+        Skopeo wraps connection/auth errors inside 'Error parsing image name',
+        hiding the real cause.  This method extracts the actual reason.
+        """
+        stderr = stderr.strip()
+        # skopeo structured log: extract msg="..." content
+        msg_match = re.search(r'msg="(.+)"?\s*$', stderr, re.DOTALL)
+        inner = msg_match.group(1).rstrip('"') if msg_match else stderr
+
+        # Known real-cause patterns (ordered by specificity)
+        patterns = [
+            (r"unauthorized", "unauthorized – registry credentials required"),
+            (r"authentication required", "authentication required"),
+            (r"no such host", "registry host not found (DNS)"),
+            (r"connection refused", "registry connection refused"),
+            (r"certificate.+unknown authority", "TLS certificate not trusted"),
+            (r"manifest unknown", "manifest not found in registry"),
+            (r"timeout", "registry connection timeout"),
+            (r"no basic auth credentials", "no auth credentials provided"),
+        ]
+        for pat, friendly in patterns:
+            if re.search(pat, inner, re.IGNORECASE):
+                return f"skopeo: {friendly}"
+
+        # Fallback: return full stderr (up to 500 chars)
+        return f"skopeo failed: {stderr[:500]}"
+
     def _skopeo_inspect_one(self, image: str):
         report = self.image_reports[image]
         cmd = ["skopeo", "inspect"]
         tmp_auth_file = None
 
-        if not self.skopeo_tls_verify:
+        is_internal = bool(self._internal_registry and self._internal_registry in image)
+
+        # Internal registry always needs --tls-verify=false (self-signed certs)
+        if not self.skopeo_tls_verify or is_internal:
             cmd.append("--tls-verify=false")
 
         # Auth file priority:
@@ -776,7 +809,7 @@ class CGroupsV2Scanner:
             if tmp_auth_file:
                 cmd.extend(["--authfile", tmp_auth_file])
 
-        if self._sa_token and self._internal_registry and self._internal_registry in image:
+        if self._sa_token and is_internal:
             cmd.extend(["--creds", f"serviceaccount:{self._sa_token}"])
 
         # Normalize image reference for skopeo.
@@ -805,7 +838,7 @@ class CGroupsV2Scanner:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             if result.returncode != 0:
-                error_msg = f"skopeo failed: {result.stderr[:150]}"
+                error_msg = self._parse_skopeo_error(result.stderr, image)
                 report.inspection_error = error_msg
                 with _skopeo_cache_lock:
                     _skopeo_cache_errors[image] = error_msg
