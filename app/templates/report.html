@@ -294,7 +294,14 @@ function changePerPage(val) {
 function applyPagination() {
   var rows = [];
   document.querySelectorAll(".image-row").forEach(function(row) {
-    if (row.dataset.filtered !== "true") {
+    if (row.dataset.filtered === "true") {
+      // Hide filtered-out rows explicitly
+      row.style.display = "none";
+      var next = row.nextElementSibling;
+      if (next && next.classList.contains("findings-row")) {
+        next.style.display = "none";
+      }
+    } else {
       rows.push(row);
     }
   });

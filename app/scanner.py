@@ -27,14 +27,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# In-memory skopeo inspection cache (shared across scans)
-# Avoids re-inspecting the same image across namespaces/pods, which prevents
-# HTTP 429 rate-limiting from Docker Hub, Quay, and other registries.
-# ─────────────────────────────────────────────────────────────────────────────
-_skopeo_cache: Dict[str, dict] = {}  # image -> skopeo JSON data
-_skopeo_cache_errors: Dict[str, str] = {}  # image -> error message
-_skopeo_cache_lock = threading.Lock()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Detection rules
@@ -718,30 +711,10 @@ class CGroupsV2Scanner:
     def _skopeo_inspect_all(self):
         images = list(self.image_reports.keys())
         total = len(images)
-        cache_hits = 0
 
-        # Check the in-memory cache first to avoid re-inspecting already known images.
-        # This prevents HTTP 429 rate-limiting from Docker Hub / Quay / etc.
-        images_to_inspect = []
-        with _skopeo_cache_lock:
-            for img in images:
-                if img in _skopeo_cache:
-                    report = self.image_reports[img]
-                    report.inspected = True
-                    self._analyze_skopeo_data(report, _skopeo_cache[img])
-                    cache_hits += 1
-                elif img in _skopeo_cache_errors:
-                    self.image_reports[img].inspection_error = _skopeo_cache_errors[img]
-                    cache_hits += 1
-                else:
-                    images_to_inspect.append(img)
+        images_to_inspect = images
 
-        logger.info(f"Skopeo inspection: {total} images total, {cache_hits} from cache, "
-                    f"{len(images_to_inspect)} to inspect")
-
-        if not images_to_inspect:
-            self._report_progress("skopeo", total, total, "All from cache")
-            return
+        logger.info(f"Skopeo inspection: {total} images to inspect")
 
         inspect_total = len(images_to_inspect)
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -750,7 +723,7 @@ class CGroupsV2Scanner:
             for future in as_completed(futures):
                 done += 1
                 img = futures[future]
-                self._report_progress("skopeo", cache_hits + done, total,
+                self._report_progress("skopeo", done, total,
                     f"Inspecting ({done}/{inspect_total}): {img[:60]}")
                 try:
                     future.result()
@@ -838,23 +811,14 @@ class CGroupsV2Scanner:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             if result.returncode != 0:
-                error_msg = self._parse_skopeo_error(result.stderr, image)
-                report.inspection_error = error_msg
-                with _skopeo_cache_lock:
-                    _skopeo_cache_errors[image] = error_msg
+                report.inspection_error = self._parse_skopeo_error(result.stderr, image)
                 return
             data = json.loads(result.stdout)
         except subprocess.TimeoutExpired:
-            error_msg = "skopeo timeout"
-            report.inspection_error = error_msg
-            with _skopeo_cache_lock:
-                _skopeo_cache_errors[image] = error_msg
+            report.inspection_error = "skopeo timeout"
             return
         except json.JSONDecodeError:
-            error_msg = "invalid JSON from skopeo"
-            report.inspection_error = error_msg
-            with _skopeo_cache_lock:
-                _skopeo_cache_errors[image] = error_msg
+            report.inspection_error = "invalid JSON from skopeo"
             return
         finally:
             # Clean up temporary auth file
@@ -863,10 +827,6 @@ class CGroupsV2Scanner:
                     os.unlink(tmp_auth_file)
                 except OSError:
                     pass
-
-        # Cache the result for future scans
-        with _skopeo_cache_lock:
-            _skopeo_cache[image] = data
 
         report.inspected = True
         self._analyze_skopeo_data(report, data)
@@ -999,7 +959,7 @@ class CGroupsV2Scanner:
             "init_only_images": init_only,
             "inspected_via_skopeo": sum(1 for r in self.image_reports.values() if r.inspected),
             "skopeo_errors": sum(1 for r in self.image_reports.values() if r.inspection_error),
-            "skopeo_cache_size": len(_skopeo_cache),
+
             "by_severity": dict(by_severity),
         }
 
