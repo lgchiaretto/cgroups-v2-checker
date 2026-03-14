@@ -33,13 +33,17 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   function startScan() {
-    const nsField = document.getElementById("opt-namespaces").value.trim();
-    const exField = document.getElementById("opt-exclude").value.trim();
-    const inspectImages = document.getElementById("opt-inspect").checked;
+    var nsField = document.getElementById("opt-namespaces").value.trim();
+    var exField = document.getElementById("opt-exclude").value.trim();
+    var nsPatternsField = document.getElementById("opt-ns-patterns").value.trim();
+    var exPatternsField = document.getElementById("opt-exclude-patterns").value.trim();
+    var inspectImages = document.getElementById("opt-inspect").checked;
 
-    const body = { inspect_images: inspectImages };
+    var body = { inspect_images: inspectImages };
     if (nsField) body.namespaces = nsField.split(",").map(function (s) { return s.trim(); });
     if (exField) body.exclude_namespaces = exField.split(",").map(function (s) { return s.trim(); });
+    if (nsPatternsField) body.namespace_patterns = nsPatternsField.split(",").map(function (s) { return s.trim(); });
+    if (exPatternsField) body.exclude_patterns = exPatternsField.split(",").map(function (s) { return s.trim(); });
 
     scanOptionsPanel.style.display = "none";
     scanProgressPanel.style.display = "";

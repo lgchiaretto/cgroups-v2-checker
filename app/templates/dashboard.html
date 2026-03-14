@@ -54,10 +54,24 @@
         <input class="pf-v6-c-form-control" type="text" id="opt-namespaces" placeholder="e.g. my-app, staging">
       </div>
       <div class="pf-v6-c-form__group pf-v6-u-mb-md">
+        <label class="pf-v6-c-form__label" for="opt-ns-patterns">
+          <span class="pf-v6-c-form__label-text">Namespace Patterns (regex)</span>
+        </label>
+        <span class="pf-v6-c-form__helper-text">Comma-separated regex patterns to include namespaces. E.g. <code>chiaretto-.*</code> or <code>.*-stg$, .*-dev$</code></span>
+        <input class="pf-v6-c-form-control" type="text" id="opt-ns-patterns" placeholder="e.g. chiaretto-.*, .*-stg$">
+      </div>
+      <div class="pf-v6-c-form__group pf-v6-u-mb-md">
         <label class="pf-v6-c-form__label" for="opt-exclude">
           <span class="pf-v6-c-form__label-text">Exclude Namespaces</span>
         </label>
         <input class="pf-v6-c-form-control" type="text" id="opt-exclude" placeholder="e.g. test, sandbox">
+      </div>
+      <div class="pf-v6-c-form__group pf-v6-u-mb-md">
+        <label class="pf-v6-c-form__label" for="opt-exclude-patterns">
+          <span class="pf-v6-c-form__label-text">Exclude Patterns (regex)</span>
+        </label>
+        <span class="pf-v6-c-form__helper-text">Comma-separated regex patterns to exclude namespaces. E.g. <code>.*-dev$</code></span>
+        <input class="pf-v6-c-form-control" type="text" id="opt-exclude-patterns" placeholder="e.g. .*-dev$, teste-.*">
       </div>
       <div class="pf-v6-c-check pf-v6-u-mb-md">
         <input class="pf-v6-c-check__input" type="checkbox" id="opt-inspect" checked>
@@ -101,6 +115,7 @@
           <th role="columnheader">High</th>
           <th role="columnheader">Medium</th>
           <th role="columnheader">Low</th>
+          <th role="columnheader">Unknown</th>
           <th role="columnheader">OK</th>
           <th role="columnheader">Actions</th>
         </tr>
@@ -129,6 +144,12 @@
             {% else %}0{% endif %}
           </td>
           <td role="cell" data-label="Low">{{ r.by_severity.get("LOW", 0) }}</td>
+          <td role="cell" data-label="Unknown">
+            {% set unk = r.by_severity.get("UNKNOWN", 0) %}
+            {% if unk > 0 %}
+              <span class="pf-v6-c-label pf-m-purple"><span class="pf-v6-c-label__content">{{ unk }}</span></span>
+            {% else %}0{% endif %}
+          </td>
           <td role="cell" data-label="OK">{{ r.by_severity.get("OK", 0) }}</td>
           <td role="cell" data-label="Actions">
             <a href="/reports/{{ r.id }}" class="pf-v6-c-button pf-m-link pf-m-small" title="View">

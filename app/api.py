@@ -66,6 +66,8 @@ def start_scan():
     body = request.get_json(silent=True) or {}
     namespaces = body.get("namespaces")  # list or None (all)
     exclude_namespaces = body.get("exclude_namespaces")
+    namespace_patterns = body.get("namespace_patterns")  # regex patterns for include
+    exclude_patterns = body.get("exclude_patterns")  # regex patterns for exclude
     inspect_images = body.get("inspect_images", True)
 
     scan_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
@@ -91,7 +93,7 @@ def start_scan():
     app = current_app._get_current_object()
     t = threading.Thread(
         target=_run_scan,
-        args=(app, scan_id, namespaces, exclude_namespaces, inspect_images),
+        args=(app, scan_id, namespaces, exclude_namespaces, namespace_patterns, exclude_patterns, inspect_images),
         daemon=True,
     )
     t.start()
@@ -268,7 +270,7 @@ def delete_registry(registry_host: str):
 # ─────────────────────────────────────────────────────────────────────────────
 # Background scan runner
 # ─────────────────────────────────────────────────────────────────────────────
-def _run_scan(app, scan_id, namespaces, exclude_namespaces, inspect_images):
+def _run_scan(app, scan_id, namespaces, exclude_namespaces, namespace_patterns, exclude_patterns, inspect_images):
     """Execute scan in background thread."""
     with app.app_context():
         state = _scans[scan_id]
@@ -285,6 +287,8 @@ def _run_scan(app, scan_id, namespaces, exclude_namespaces, inspect_images):
             scanner = CGroupsV2Scanner(
                 namespaces=namespaces,
                 exclude_namespaces=exclude_namespaces,
+                namespace_patterns=namespace_patterns,
+                exclude_patterns=exclude_patterns,
                 skip_system_ns=app.config["SKIP_SYSTEM_NAMESPACES"],
                 inspect_images=inspect_images,
                 skopeo_tls_verify=app.config["SKOPEO_TLS_VERIFY"],

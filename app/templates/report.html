@@ -2,7 +2,7 @@
 {% block title %}Report {{ report_id }} - cgroups v2 Checker{% endblock %}
 
 {% block content %}
-{% set sev_colors = {"CRITICAL": "red", "HIGH": "orange", "MEDIUM": "gold", "LOW": "blue", "OK": "green"} %}
+{% set sev_colors = {"CRITICAL": "red", "HIGH": "orange", "MEDIUM": "gold", "LOW": "blue", "UNKNOWN": "purple", "OK": "green"} %}
 
 <!-- Header -->
 <div class="pf-v6-l-flex pf-m-justify-content-space-between pf-m-align-items-center pf-v6-u-mb-lg">
@@ -54,7 +54,7 @@
         <div class="pf-v6-u-color-200"><i class="fas fa-exclamation-triangle pf-v6-u-mr-xs"></i> Not Inspected</div>
       </div>
     </div>
-    {% for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "OK"] %}
+    {% for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN", "OK"] %}
     {% set count = report.by_severity.get(sev, 0) %}
     <div class="pf-v6-c-card summary-card summary-card--clickable" data-filter-severity="{{ sev }}" title="Filter by {{ sev }}">
       <div class="pf-v6-c-card__body">
@@ -102,7 +102,7 @@
           </div>
         </div>
         <div class="pf-v6-l-flex pf-m-gap-sm" id="severity-filters">
-          {% for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "OK"] %}
+          {% for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN", "OK"] %}
           <button class="pf-v6-c-label pf-m-{{ sev_colors[sev] }} severity-filter pf-m-outline"
                   data-severity="{{ sev }}" title="Toggle {{ sev }}">
             <span class="pf-v6-c-label__content">{{ sev }}</span>

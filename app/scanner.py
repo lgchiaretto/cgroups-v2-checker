@@ -143,12 +143,14 @@ class ImageReport:
     def max_severity(self) -> str:
         order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
         if not self.findings:
+            if not self.inspected:
+                return "UNKNOWN"
             return "OK"
         return min(self.findings, key=lambda f: order.get(f.severity, 99)).severity
 
     @property
     def severity_sort_key(self) -> int:
-        order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "OK": 5}
+        order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "UNKNOWN": 5, "OK": 6}
         return order.get(self.max_severity, 99)
 
     def to_dict(self) -> dict:
@@ -223,6 +225,8 @@ class CGroupsV2Scanner:
         self,
         namespaces: Optional[List[str]] = None,
         exclude_namespaces: Optional[List[str]] = None,
+        namespace_patterns: Optional[List[str]] = None,
+        exclude_patterns: Optional[List[str]] = None,
         skip_system_ns: bool = True,
         inspect_images: bool = True,
         skopeo_tls_verify: bool = True,
@@ -233,6 +237,9 @@ class CGroupsV2Scanner:
     ):
         self.target_namespaces = namespaces
         self.exclude_namespaces = set(exclude_namespaces or [])
+        # Compiled regex patterns for namespace include/exclude
+        self._ns_include_patterns = self._compile_patterns(namespace_patterns)
+        self._ns_exclude_patterns = self._compile_patterns(exclude_patterns)
         self.skip_system_ns = skip_system_ns
         self.inspect_images = inspect_images
         self.skopeo_tls_verify = skopeo_tls_verify
@@ -249,6 +256,32 @@ class CGroupsV2Scanner:
         self._registry_auths: Dict[str, dict] = {}
         # Tracks which image pull secrets have already been processed
         self._processed_pull_secrets: Set[str] = set()
+
+    @staticmethod
+    def _compile_patterns(patterns: Optional[List[str]]) -> List[re.Pattern]:
+        """Compile a list of regex pattern strings, ignoring invalid ones."""
+        compiled = []
+        for p in (patterns or []):
+            p = p.strip()
+            if not p:
+                continue
+            try:
+                compiled.append(re.compile(p))
+            except re.error as e:
+                logger.warning(f"Invalid regex pattern '{p}': {e}")
+        return compiled
+
+    def _namespace_included(self, ns: str) -> bool:
+        """Check if namespace matches include patterns (if any are defined)."""
+        if not self._ns_include_patterns:
+            return True  # no include patterns = include all
+        return any(p.search(ns) for p in self._ns_include_patterns)
+
+    def _namespace_excluded(self, ns: str) -> bool:
+        """Check if namespace matches exclude patterns."""
+        if ns in self.exclude_namespaces:
+            return True
+        return any(p.search(ns) for p in self._ns_exclude_patterns)
 
     # ─────────────────────────────────────────────────────────────────────
     # Progress reporting
@@ -491,16 +524,21 @@ class CGroupsV2Scanner:
         skipped = 0
         skipped_excluded = 0
         skipped_system = 0
+        skipped_pattern = 0
 
         for pod in all_pods:
             ns = pod.metadata.namespace
-            if ns in self.exclude_namespaces:
+            if self._namespace_excluded(ns):
                 skipped += 1
                 skipped_excluded += 1
                 continue
             if self.skip_system_ns and ns in OPENSHIFT_SYSTEM_NS:
                 skipped += 1
                 skipped_system += 1
+                continue
+            if not self._namespace_included(ns):
+                skipped += 1
+                skipped_pattern += 1
                 continue
 
             total_pods += 1
@@ -546,6 +584,8 @@ class CGroupsV2Scanner:
             skip_parts.append(f"system namespaces: {skipped_system}")
         if skipped_excluded > 0:
             skip_parts.append(f"excluded namespaces: {skipped_excluded}")
+        if skipped_pattern > 0:
+            skip_parts.append(f"pattern filter: {skipped_pattern}")
         if skip_parts:
             self.cluster_info["pods_skipped"] = f"{skipped} ({', '.join(skip_parts)})"
         else:
