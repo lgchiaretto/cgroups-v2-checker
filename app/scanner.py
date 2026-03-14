@@ -787,11 +787,19 @@ class CGroupsV2Scanner:
         if "@sha256:" in skopeo_ref:
             # Split at @, then remove the tag from the name part (before @)
             name_part, digest_part = skopeo_ref.split("@", 1)
-            # name_part might be "registry/repo:tag" — strip the tag
-            if ":" in name_part:
-                # Only strip if it looks like a tag (after the last colon in the path)
-                base = name_part.rsplit(":", 1)[0]
-                skopeo_ref = f"{base}@{digest_part}"
+            # name_part might be "registry:5000/repo:tag" — strip only the TAG,
+            # not the registry port.  The tag is always after the last '/'.
+            last_slash = name_part.rfind("/")
+            if last_slash >= 0:
+                repo_part = name_part[last_slash + 1:]
+                if ":" in repo_part:
+                    # Strip the tag from the final path segment
+                    name_part = name_part[:last_slash + 1] + repo_part.rsplit(":", 1)[0]
+            else:
+                # No slash at all (e.g. "image:tag@sha256:...")
+                if ":" in name_part:
+                    name_part = name_part.rsplit(":", 1)[0]
+            skopeo_ref = f"{name_part}@{digest_part}"
         cmd.append(f"docker://{skopeo_ref}")
 
         try:
