@@ -46,39 +46,26 @@
   </div>
   <div class="pf-v6-c-card__body">
     <form id="scan-options-form">
-      <div class="pf-v6-c-form__group pf-v6-u-mb-md">
-        <label class="pf-v6-c-form__label" for="opt-namespaces">
-          <span class="pf-v6-c-form__label-text">Namespaces</span>
+      <div class="pf-v6-c-form__group pf-v6-u-mb-lg">
+        <label class="pf-v6-c-form__label pf-v6-u-mb-sm" for="opt-include">
+          <span class="pf-v6-c-form__label-text">Include Namespaces</span>
         </label>
-        <span class="pf-v6-c-form__helper-text">Comma-separated list. Leave empty for all namespaces.</span>
-        <input class="pf-v6-c-form-control" type="text" id="opt-namespaces" placeholder="e.g. my-app, staging">
+        <span class="pf-v6-c-form__helper-text pf-v6-u-mb-sm">Comma-separated names or regex patterns. Leave empty for all namespaces.<br>Examples: <code>my-app, staging</code> or <code>siaf-.*, .*-stg$</code></span>
+        <input class="pf-v6-c-form-control" type="text" id="opt-include" placeholder="e.g. my-app, siaf-.*, .*-stg$">
       </div>
-      <div class="pf-v6-c-form__group pf-v6-u-mb-md">
-        <label class="pf-v6-c-form__label" for="opt-ns-patterns">
-          <span class="pf-v6-c-form__label-text">Namespace Patterns (regex)</span>
-        </label>
-        <span class="pf-v6-c-form__helper-text">Comma-separated regex patterns to include namespaces. E.g. <code>chiaretto-.*</code> or <code>.*-stg$, .*-dev$</code></span>
-        <input class="pf-v6-c-form-control" type="text" id="opt-ns-patterns" placeholder="e.g. chiaretto-.*, .*-stg$">
-      </div>
-      <div class="pf-v6-c-form__group pf-v6-u-mb-md">
-        <label class="pf-v6-c-form__label" for="opt-exclude">
+      <div class="pf-v6-c-form__group pf-v6-u-mb-lg">
+        <label class="pf-v6-c-form__label pf-v6-u-mb-sm" for="opt-exclude">
           <span class="pf-v6-c-form__label-text">Exclude Namespaces</span>
         </label>
-        <input class="pf-v6-c-form-control" type="text" id="opt-exclude" placeholder="e.g. test, sandbox">
+        <span class="pf-v6-c-form__helper-text pf-v6-u-mb-sm">Comma-separated names or regex patterns to exclude.<br>Examples: <code>test, sandbox</code> or <code>.*-dev$, teste-.*</code></span>
+        <input class="pf-v6-c-form-control" type="text" id="opt-exclude" placeholder="e.g. test, .*-dev$, sandbox">
       </div>
-      <div class="pf-v6-c-form__group pf-v6-u-mb-md">
-        <label class="pf-v6-c-form__label" for="opt-exclude-patterns">
-          <span class="pf-v6-c-form__label-text">Exclude Patterns (regex)</span>
-        </label>
-        <span class="pf-v6-c-form__helper-text">Comma-separated regex patterns to exclude namespaces. E.g. <code>.*-dev$</code></span>
-        <input class="pf-v6-c-form-control" type="text" id="opt-exclude-patterns" placeholder="e.g. .*-dev$, teste-.*">
-      </div>
-      <div class="pf-v6-c-check pf-v6-u-mb-md">
+      <div class="pf-v6-c-check pf-v6-u-mb-lg">
         <input class="pf-v6-c-check__input" type="checkbox" id="opt-inspect" checked>
         <label class="pf-v6-c-check__label" for="opt-inspect">Enable skopeo remote inspection (Level 2)</label>
         <span class="pf-v6-c-check__description">Uses skopeo to read image metadata. No layers are downloaded.</span>
       </div>
-      <div class="pf-v6-l-flex pf-m-gap-sm">
+      <div class="pf-v6-l-flex pf-m-gap-md pf-v6-u-mt-lg">
         <button type="submit" class="pf-v6-c-button pf-m-primary">
           <i class="fas fa-play pf-v6-u-mr-sm"></i> Start Scan
         </button>

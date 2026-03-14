@@ -32,18 +32,33 @@ document.addEventListener("DOMContentLoaded", function () {
     });
   }
 
+  function _isRegex(s) {
+    return /[.*+?^${}()|\[\]\\]/.test(s);
+  }
+
+  function _splitField(fieldId) {
+    var val = document.getElementById(fieldId).value.trim();
+    if (!val) return { names: [], patterns: [] };
+    var names = [];
+    var patterns = [];
+    val.split(",").forEach(function (s) {
+      s = s.trim();
+      if (!s) return;
+      if (_isRegex(s)) { patterns.push(s); } else { names.push(s); }
+    });
+    return { names: names, patterns: patterns };
+  }
+
   function startScan() {
-    var nsField = document.getElementById("opt-namespaces").value.trim();
-    var exField = document.getElementById("opt-exclude").value.trim();
-    var nsPatternsField = document.getElementById("opt-ns-patterns").value.trim();
-    var exPatternsField = document.getElementById("opt-exclude-patterns").value.trim();
+    var include = _splitField("opt-include");
+    var exclude = _splitField("opt-exclude");
     var inspectImages = document.getElementById("opt-inspect").checked;
 
     var body = { inspect_images: inspectImages };
-    if (nsField) body.namespaces = nsField.split(",").map(function (s) { return s.trim(); });
-    if (exField) body.exclude_namespaces = exField.split(",").map(function (s) { return s.trim(); });
-    if (nsPatternsField) body.namespace_patterns = nsPatternsField.split(",").map(function (s) { return s.trim(); });
-    if (exPatternsField) body.exclude_patterns = exPatternsField.split(",").map(function (s) { return s.trim(); });
+    if (include.names.length) body.namespaces = include.names;
+    if (include.patterns.length) body.namespace_patterns = include.patterns;
+    if (exclude.names.length) body.exclude_namespaces = exclude.names;
+    if (exclude.patterns.length) body.exclude_patterns = exclude.patterns;
 
     scanOptionsPanel.style.display = "none";
     scanProgressPanel.style.display = "";
