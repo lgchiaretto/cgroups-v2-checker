@@ -72,11 +72,13 @@ KNOWN_PROBLEMATIC_BASES = {
     ),
 }
 
-JAVA_SAFE_VERSIONS = "JDK 15+, JDK 11.0.19+, JDK 8u372+"
+JAVA_SAFE_VERSIONS = "JDK 17+, JDK 11.0.16+, JDK 8u372+"
 JAVA_DETAIL = (
-    "JDK < 15 unpatched does not recognize cgroups v2 for memory/CPU limits. "
-    "This causes: containers not respecting memory limits (unexpected OOMKill), "
-    "incorrect availableProcessors() calculation, and wrong heap sizing."
+    "JDK without cgroups v2 support does not recognize container memory/CPU limits. "
+    "Memory impact: heap decouples from container size, causing OOMKill by the kernel. "
+    "CPU impact: thread pools (including GC threads) are calculated from host CPU count, "
+    "causing excessive threads, CPU throttling, and latency. "
+    "See: developers.redhat.com/articles/2025/11/27/how-does-cgroups-v2-impact-java-net-and-nodejs-openshift-4"
 )
 
 CGROUPS_V1_PATHS = [
@@ -650,7 +652,7 @@ class CGroupsV2Scanner:
         if m:
             major, minor, patch = int(m.group(1)), int(m.group(2) or 0), int(m.group(3) or 0)
             safe = (major >= 15 or
-                    (major == 11 and (minor > 0 or patch >= 19)) or
+                    (major == 11 and (minor > 0 or patch >= 16)) or
                     (major == 8 and patch >= 372))
             if not safe:
                 sev = "HIGH" if major < 11 else "MEDIUM"
@@ -659,19 +661,29 @@ class CGroupsV2Scanner:
                     f"{JAVA_DETAIL} Safe versions: {JAVA_SAFE_VERSIONS}",
                     f"Tag version: {m.group(0)}"))
 
-        # .NET
+        # .NET — .NET 5+ is fully cgroups v2 compatible (since 2020)
         m = re.search(r"(?:dotnet|aspnet|dotnet-runtime)[:\-/](\d+)\.(\d+)", img)
-        if m and int(m.group(1)) < 6:
-            report.findings.append(Finding(".NET Runtime", "MEDIUM",
-                f".NET {m.group(1)}.{m.group(2)} — limited cgroups v2 support",
-                "Migrate to .NET 6+."))
+        if m and int(m.group(1)) < 5:
+            report.findings.append(Finding(".NET Runtime", "HIGH",
+                f".NET {m.group(1)}.{m.group(2)} — no cgroups v2 support",
+                "Migrate to .NET 5+ (recommended: .NET 8+). "
+                ".NET 5+ has full cgroups v2 compatibility since 2020."))
 
-        # Node.js
+        # Node.js — Node.js 20+ is fully cgroups v2 compatible;
+        # Node.js 22+ has additional memory management improvements
         m = re.search(r"node[:\-_](\d+)", img)
-        if m and int(m.group(1)) < 16:
-            report.findings.append(Finding("Node.js Runtime", "LOW",
-                f"Node.js {m.group(1)} — may have cgroups v2 metrics issues",
-                "Consider Node.js 16+."))
+        if m:
+            node_major = int(m.group(1))
+            if node_major < 16:
+                report.findings.append(Finding("Node.js Runtime", "HIGH",
+                    f"Node.js {node_major} — no cgroups v2 support",
+                    "Migrate to Node.js 20+ (recommended: Node.js 22+). "
+                    "Memory heap calculation will use host limits, not container limits."))
+            elif node_major < 20:
+                report.findings.append(Finding("Node.js Runtime", "MEDIUM",
+                    f"Node.js {node_major} — limited cgroups v2 support",
+                    "Migrate to Node.js 20+ for full cgroups v2 support. "
+                    "Node.js 22+ recommended for improved container memory management."))
 
         # Python
         m = re.search(r"python[:\-_](\d+)\.(\d+)", img)
@@ -702,6 +714,20 @@ class CGroupsV2Scanner:
              "Old WildFly — JVM likely without cgroups v2 support", "Update to WildFly 26+."),
             (r"tomcat[:\-_/](7\.|8\.0|8\.5\.[0-6]\d(?:\D|$))", "App Server", "MEDIUM",
              "Old Tomcat — check JDK for cgroups v2 compatibility", "Use Tomcat 10+ with JDK 17+."),
+            # Red Hat middleware — scripts may be cgroups v1-only
+            (r"jboss-eap-7[:\-_/](7\.0|7\.1|7\.2|7\.3)(?:\.|$)", "App Server", "HIGH",
+             "JBoss EAP 7 (old) — init scripts may be cgroups v1-only, causing Xmx miscalculation",
+             "Upgrade to latest JBoss EAP 7.4.x+ or EAP 8. EAP 8 relies on OpenJDK for cgroups detection."),
+            (r"eap-xp[:\-_/][12]\.", "App Server", "MEDIUM",
+             "JBoss EAP XP (old) — check init scripts for cgroups v1 assumptions",
+             "Upgrade to latest EAP XP or EAP 8."),
+            (r"datagrid-8-rhel8|datagrid[:\-_/]8\.([0-2]\.|3\.[0-6])", "Data Grid", "HIGH",
+             "Red Hat Data Grid 8 (pre-8.3.7) — init script is cgroups v1-only, Xmx miscalculated",
+             "Upgrade to Data Grid 8.3.7+ (fixes cgroups v2 Xmx script) or 8.4.6+ (50% heap). "
+             "Pre-8.3.7 defaults to 25% of host memory instead of container memory."),
+            (r"amq-broker[:\-_/](7\.[0-9]|7\.1[01])(?:\.|$)", "Messaging", "MEDIUM",
+             "Old AMQ Broker — check JVM and init scripts for cgroups v2 support",
+             "Upgrade to latest AMQ Broker with JDK 17+."),
         ]
         for pattern, cat, sev, msg, rec in checks:
             if re.search(pattern, img):
@@ -862,6 +888,9 @@ class CGroupsV2Scanner:
                     "Migrate to UBI 8/9.",
                     f"Label: {rh_comp}"))
 
+        # Red Hat middleware detection via labels
+        self._check_middleware_labels(report, labels)
+
         # ENV / CMD / Entrypoint cgroups v1 references
         all_text = " ".join(str(x) for x in entrypoint + cmd + env_list)
         for v1_path in CGROUPS_V1_PATHS:
@@ -902,7 +931,7 @@ class CGroupsV2Scanner:
         if major == 0:
             return
         safe = (major >= 15 or
-                (major == 11 and (minor > 0 or patch >= 19)) or
+                (major == 11 and (minor > 0 or patch >= 16)) or
                 (major == 8 and patch >= 372))
         if not safe:
             if not any(f.category == "Java Runtime (skopeo)" for f in report.findings):
@@ -911,6 +940,55 @@ class CGroupsV2Scanner:
                     f"Java {ver} via JAVA_VERSION ENV — may not support cgroups v2",
                     f"Safe versions: {JAVA_SAFE_VERSIONS}",
                     f"ENV JAVA_VERSION={ver}"))
+
+    def _check_middleware_labels(self, report: ImageReport, labels: dict):
+        """Detect Red Hat middleware products via OCI/Red Hat labels.
+
+        JBoss EAP 7, Data Grid 8 (pre-8.3.7), and other middleware may use
+        init scripts that are cgroups v1-only for Xmx calculation.
+        """
+        rh_comp = labels.get("com.redhat.component", "").lower()
+        version_label = (
+            labels.get("version", "")
+            or labels.get("org.opencontainers.image.version", "")
+        )
+        name_label = labels.get("name", "").lower()
+        summary_label = labels.get("summary", "").lower()
+
+        # JBoss EAP detection
+        if "eap" in rh_comp or "jboss-eap" in name_label or "eap" in summary_label:
+            # Old EAP 7 images had cgroups v1-only memory scripts
+            if re.search(r"7\.[0-3]", version_label):
+                if not any("EAP" in f.message for f in report.findings):
+                    report.findings.append(Finding("Middleware (skopeo)", "HIGH",
+                        f"JBoss EAP {version_label} — init scripts may be cgroups v1-only",
+                        "Upgrade to latest JBoss EAP 7.4.x+ or EAP 8. "
+                        "EAP 8 fully relies on OpenJDK layer for cgroups detection.",
+                        f"Label: com.redhat.component={rh_comp}"))
+
+        # Red Hat Data Grid detection
+        if "datagrid" in rh_comp or "infinispan" in name_label or "data grid" in summary_label:
+            m = re.match(r"(\d+)\.(\d+)\.?(\d*)", version_label)
+            if m:
+                dg_major, dg_minor, dg_patch = (
+                    int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+                )
+                # Data Grid 8.3.x before 8.3.7 has cgroups v1-only Xmx script
+                if dg_major == 8 and (dg_minor < 3 or (dg_minor == 3 and dg_patch < 7)):
+                    if not any("Data Grid" in f.message for f in report.findings):
+                        report.findings.append(Finding("Middleware (skopeo)", "HIGH",
+                            f"Red Hat Data Grid {version_label} — Xmx script is cgroups v1-only",
+                            "Upgrade to Data Grid 8.3.7+ or 8.4.6+. "
+                            "Pre-8.3.7 uses host memory for Xmx calculation, not container memory.",
+                            f"Label: com.redhat.component={rh_comp}"))
+                # DG 8.3.7+ works but uses 25% instead of intended 50%
+                elif dg_major == 8 and dg_minor == 3 and dg_patch >= 7:
+                    report.findings.append(Finding("Middleware (skopeo)", "LOW",
+                        f"Red Hat Data Grid {version_label} — heap defaults to 25% of container",
+                        "Data Grid 8.3.7+ is cgroups v2 compatible but uses 25% heap "
+                        "(upstream default). Upgrade to 8.4.6+ for 50% heap, or set "
+                        "MaxRAMPercentage explicitly.",
+                        f"Label: com.redhat.component={rh_comp}"))
 
     # ─────────────────────────────────────────────────────────────────────
     # Report generation
@@ -952,7 +1030,7 @@ class CGroupsV2Scanner:
 
         init_only = sum(1 for r in self.image_reports.values() if r.only_in_init)
 
-        return {
+        summary = {
             "generated_at": datetime.now().isoformat(),
             "cluster_info": self.cluster_info,
             "total_images": len(self.image_reports),
@@ -962,6 +1040,64 @@ class CGroupsV2Scanner:
 
             "by_severity": dict(by_severity),
         }
+
+        # Add OCP cgroups context based on detected cluster version
+        ocp_ver = self.cluster_info.get("openshift_version", "")
+        summary["cgroups_context"] = self._get_cgroups_context(ocp_ver)
+
+        return summary
+
+    @staticmethod
+    def _get_cgroups_context(ocp_version: str) -> dict:
+        """Provide cgroups v1/v2 context based on the detected OCP version.
+
+        Based on: developers.redhat.com/articles/2025/11/27/
+        how-does-cgroups-v2-impact-java-net-and-nodejs-openshift-4
+        """
+        ctx = {"version": ocp_version, "risk_level": "unknown", "detail": ""}
+        if not ocp_version or ocp_version.startswith("N/A"):
+            ctx["detail"] = "Could not detect OpenShift version."
+            return ctx
+
+        m = re.match(r"(\d+)\.(\d+)", ocp_version)
+        if not m:
+            return ctx
+
+        major, minor = int(m.group(1)), int(m.group(2))
+        if major != 4:
+            return ctx
+
+        if minor <= 13:
+            ctx["risk_level"] = "low"
+            ctx["cgroups_default"] = "v1"
+            ctx["v1_support"] = True
+            ctx["v2_support"] = False
+            ctx["detail"] = (
+                f"OCP {ocp_version} uses cgroups v1 only. "
+                "No immediate cgroups v2 concern, but plan for future upgrades."
+            )
+        elif minor <= 18:
+            ctx["risk_level"] = "moderate"
+            ctx["cgroups_default"] = "v2 (new installs since 4.14)"
+            ctx["v1_support"] = True
+            ctx["v2_support"] = True
+            ctx["detail"] = (
+                f"OCP {ocp_version} supports both cgroups v1 and v2. "
+                "New installations default to v2 since 4.14. Upgrades keep previous setting. "
+                "Prepare applications for cgroups v2 before moving to 4.19+."
+            )
+        else:  # 4.19+
+            ctx["risk_level"] = "high"
+            ctx["cgroups_default"] = "v2"
+            ctx["v1_support"] = False
+            ctx["v2_support"] = True
+            ctx["detail"] = (
+                f"OCP {ocp_version} requires cgroups v2 — v1 is removed. "
+                "All applications MUST be cgroups v2 compatible. "
+                "Incompatible apps will use host limits, causing OOMKill and CPU throttling."
+            )
+
+        return ctx
 
     def get_full_report(self) -> dict:
         """Return the full report as a serializable dictionary."""

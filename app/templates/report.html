@@ -90,6 +90,26 @@
   </div>
   {% endif %}
 
+  <!-- cgroups v2 context (based on detected OCP version) -->
+  {% if report.cgroups_context and report.cgroups_context.detail %}
+  {% set ctx = report.cgroups_context %}
+  {% set alert_type = "danger" if ctx.risk_level == "high" else ("warning" if ctx.risk_level == "moderate" else "info") %}
+  {% set alert_icon = "exclamation-circle" if ctx.risk_level == "high" else ("exclamation-triangle" if ctx.risk_level == "moderate" else "info-circle") %}
+  <div class="pf-v6-c-alert pf-m-{{ alert_type }} pf-m-inline pf-v6-u-mb-lg">
+    <div class="pf-v6-c-alert__icon"><i class="fas fa-{{ alert_icon }}"></i></div>
+    <h4 class="pf-v6-c-alert__title">cgroups Status: {{ ctx.cgroups_default | default("unknown") }}</h4>
+    <div class="pf-v6-c-alert__description">
+      <p>{{ ctx.detail }}</p>
+      {% if ctx.v1_support is defined %}
+      <p class="pf-v6-u-mt-sm pf-v6-u-font-size-sm">
+        cgroups v1: {{ "supported" if ctx.v1_support else "not supported" }} |
+        cgroups v2: {{ "supported" if ctx.v2_support else "not supported" }}
+      </p>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+
   <!-- Filter bar -->
   <div class="pf-v6-c-card pf-v6-u-mb-md">
     <div class="pf-v6-c-card__body">
