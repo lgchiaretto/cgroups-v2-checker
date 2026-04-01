@@ -1,4 +1,9 @@
+# It's safe to use the latest and greatest here
+# hadolint ignore=DL3007
 FROM registry.access.redhat.com/ubi9/python-312:latest
+
+# Setting to SemVer with no breaking changes in between
+ARG SKOPEO_VER="2:1.20.*"
 
 LABEL name="cgroups-v2-checker" \
       summary="OpenShift cgroups v2 Compatibility Checker" \
@@ -6,10 +11,14 @@ LABEL name="cgroups-v2-checker" \
       io.k8s.display-name="cgroups v2 Checker" \
       io.openshift.tags="openshift,cgroups,scanner"
 
-USER root
+# Better stick to 0 instead of 'root'
+USER 0
 
 # Install skopeo (required for remote image inspection)
-RUN dnf install -y --nodocs skopeo && \
+# Ignoring due to known issue https://github.com/hadolint/hadolint/issues/1136 with Hadolint v2.14.0
+# hadolint ignore=DL3041
+RUN dnf install --nodocs --assumeyes \
+      "skopeo-${SKOPEO_VER}" && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
@@ -22,7 +31,8 @@ WORKDIR /app
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    find . -regex '^.*\(__pycache__\|\.py[co]\)$' -delete
 
 # Copy application code
 COPY gunicorn.conf.py .
