@@ -115,6 +115,7 @@ run_local() {
 # Wait for service to be ready
 wait_for_service() {
     log_info "Waiting for service to be ready..."
+    # shellcheck disable=SC2034 - this loop is used for 30 seconds timeout
     for i in {1..30}; do
         if curl -s "http://127.0.0.1:${LOCAL_PORT}/" >/dev/null 2>&1; then
             log_success "Service is ready!"
