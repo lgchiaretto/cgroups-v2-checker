@@ -53,8 +53,9 @@ document.addEventListener("DOMContentLoaded", function () {
     var include = _splitField("opt-include");
     var exclude = _splitField("opt-exclude");
     var inspectImages = document.getElementById("opt-inspect").checked;
+    var execCheck = document.getElementById("opt-exec-check").checked;
 
-    var body = { inspect_images: inspectImages };
+    var body = { inspect_images: inspectImages, exec_check: execCheck };
     if (include.names.length) body.namespaces = include.names;
     if (include.patterns.length) body.namespace_patterns = include.patterns;
     if (exclude.names.length) body.exclude_namespaces = exclude.names;
@@ -161,6 +162,7 @@ document.addEventListener("DOMContentLoaded", function () {
       collecting: "Collecting pod images...",
       analyzing: "Analyzing images (name/tag)...",
       skopeo: "Remote inspection via skopeo...",
+      exec_check: "Runtime check via pod exec...",
       saving: "Saving report...",
       done: "Scan complete!",
     };

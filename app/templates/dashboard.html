@@ -65,6 +65,11 @@
         <label class="pf-v6-c-check__label" for="opt-inspect">Enable skopeo remote inspection (Level 2)</label>
         <span class="pf-v6-c-check__description">Uses skopeo to read image metadata. No layers are downloaded.</span>
       </div>
+      <div class="pf-v6-c-check pf-v6-u-mb-lg">
+        <input class="pf-v6-c-check__input" type="checkbox" id="opt-exec-check">
+        <label class="pf-v6-c-check__label" for="opt-exec-check">Enable pod exec runtime check (Level 3)</label>
+        <span class="pf-v6-c-check__description">Executes a shell script inside running pods to detect cgroups v1 references in application files and environment variables. Requires <code>pods/exec</code> RBAC permission.</span>
+      </div>
       <div class="pf-v6-l-flex pf-m-gap-md pf-v6-u-mt-lg">
         <button type="submit" class="pf-v6-c-button pf-m-primary">
           <i class="fas fa-play pf-v6-u-mr-sm"></i> Start Scan
@@ -78,10 +83,10 @@
 <!-- Reports table -->
 <div class="pf-v6-c-alert pf-m-info pf-m-inline pf-v6-u-mb-md">
   <div class="pf-v6-c-alert__icon"><i class="fas fa-info-circle"></i></div>
-  <h4 class="pf-v6-c-alert__title">Nothing is persistent</h4>
+  <h4 class="pf-v6-c-alert__title">Data persistence</h4>
   <div class="pf-v6-c-alert__description">
-    Reports, scan results, and registry credentials are stored only in the pod's memory and filesystem.
-    When the pod restarts or is redeployed, all data is lost.
+    Reports and scan results are stored in the pod's filesystem (emptyDir) and lost on pod restart.
+    Registry credentials can be persisted to a Kubernetes Secret using <code>./setup.sh --persistent</code>.
   </div>
 </div>
 

@@ -54,6 +54,7 @@ This is an **OpenShift cgroups v2 Compatibility Checker** — a Flask web applic
 | `SKOPEO_MAX_WORKERS` | `10` | Concurrent skopeo inspection threads |
 | `USE_IMAGE_PULL_SECRETS` | `true` | Extract registry auth from pods |
 | `SKOPEO_AUTH_FILE` | (empty) | Global skopeo auth file path |
+| `REGISTRIES_FILE` | (empty) | Path to mounted registries.json from K8s Secret |
 
 ## When Making Changes
 - Always use PatternFly 6 components and dark theme CSS variables
@@ -62,4 +63,5 @@ This is an **OpenShift cgroups v2 Compatibility Checker** — a Flask web applic
 - Container image: `quay.io/chiaretto/cgroups-v2-checker:latest`
 - Run `./setup.sh --build-push-deploy` to ship changes
 - Reports page supports clickable severity cards (filters table), image drilldown modal (shows pods/namespaces), and CSV download
-- Registries page allows users to add/remove private registry credentials (username/password) used by skopeo during scans. Credentials stored in `REPORT_DIR/../registries.json` and merged into scanner's `_registry_auths` at scan start.
+- Registries page allows users to add/remove private registry credentials (username/password) used by skopeo during scans. Credentials stored on disk in `REPORT_DIR/../registries.json` and merged into scanner's `_registry_auths` at scan start. Use `./setup.sh --persistent` to persist to a Kubernetes Secret.
+- Scan supports 3 levels: Level 1 (name/tag analysis), Level 2 (skopeo remote inspection), Level 3 (pod exec cgroups v1 runtime detection)

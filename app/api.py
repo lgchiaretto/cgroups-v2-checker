@@ -69,6 +69,7 @@ def start_scan():
     namespace_patterns = body.get("namespace_patterns")  # regex patterns for include
     exclude_patterns = body.get("exclude_patterns")  # regex patterns for exclude
     inspect_images = body.get("inspect_images", True)
+    exec_check = body.get("exec_check", False)
 
     scan_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
 
@@ -93,7 +94,7 @@ def start_scan():
     app = current_app._get_current_object()
     t = threading.Thread(
         target=_run_scan,
-        args=(app, scan_id, namespaces, exclude_namespaces, namespace_patterns, exclude_patterns, inspect_images),
+        args=(app, scan_id, namespaces, exclude_namespaces, namespace_patterns, exclude_patterns, inspect_images, exec_check),
         daemon=True,
     )
     t.start()
@@ -166,12 +167,61 @@ def delete_report(report_id: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Registry Credentials Management (IN-MEMORY ONLY — not persisted to disk)
-# Credentials are lost when the pod restarts.
+# Registry Credentials Management
+# Credentials are stored in-memory and optionally persisted to disk.
+# Use setup.sh --persistent to persist to a Kubernetes Secret.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _registries: List[dict] = []       # [{"registry": ..., "username": ..., "password": ...}]
 _registries_lock = threading.Lock()
+
+
+def _registries_file_path() -> str:
+    """Return the path to the registries.json file on disk."""
+    report_dir = os.environ.get("REPORT_DIR", "/app/data/reports")
+    return os.path.join(os.path.dirname(report_dir), "registries.json")
+
+
+def _load_registries_from_disk() -> List[dict]:
+    """Load registries from disk file (registries.json or mounted Secret)."""
+    # Priority: mounted Secret file > local registries.json
+    secret_path = os.environ.get("REGISTRIES_FILE", "")
+    paths_to_try = []
+    if secret_path:
+        paths_to_try.append(secret_path)
+    paths_to_try.append(_registries_file_path())
+
+    for path in paths_to_try:
+        if os.path.isfile(path):
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    logger.info(f"Loaded {len(data)} registry credential(s) from {path}")
+                    return data
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"Failed to load registries from {path}: {e}")
+    return []
+
+
+def _persist_registries_to_disk(registries: List[dict]) -> None:
+    """Write registries to disk for persistence."""
+    path = _registries_file_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(registries, f, indent=2)
+    except IOError as e:
+        logger.warning(f"Failed to persist registries to {path}: {e}")
+
+
+def init_registries():
+    """Load registries from disk on startup."""
+    disk_registries = _load_registries_from_disk()
+    if disk_registries:
+        with _registries_lock:
+            _registries.clear()
+            _registries.extend(disk_registries)
 
 
 def _load_registries() -> List[dict]:
@@ -181,10 +231,11 @@ def _load_registries() -> List[dict]:
 
 
 def _save_registries(registries: List[dict]) -> None:
-    """Replace in-memory registry credentials."""
+    """Replace in-memory registry credentials and persist to disk."""
     with _registries_lock:
         _registries.clear()
         _registries.extend(registries)
+    _persist_registries_to_disk(registries)
 
 
 def _build_registry_auths(registries: List[dict]) -> Dict[str, dict]:
@@ -270,7 +321,7 @@ def delete_registry(registry_host: str):
 # ─────────────────────────────────────────────────────────────────────────────
 # Background scan runner
 # ─────────────────────────────────────────────────────────────────────────────
-def _run_scan(app, scan_id, namespaces, exclude_namespaces, namespace_patterns, exclude_patterns, inspect_images):
+def _run_scan(app, scan_id, namespaces, exclude_namespaces, namespace_patterns, exclude_patterns, inspect_images, exec_check):
     """Execute scan in background thread."""
     with app.app_context():
         state = _scans[scan_id]
@@ -291,6 +342,7 @@ def _run_scan(app, scan_id, namespaces, exclude_namespaces, namespace_patterns, 
                 exclude_patterns=exclude_patterns,
                 skip_system_ns=app.config["SKIP_SYSTEM_NAMESPACES"],
                 inspect_images=inspect_images,
+                exec_check=exec_check,
                 skopeo_tls_verify=app.config["SKOPEO_TLS_VERIFY"],
                 skopeo_auth_file=app.config["SKOPEO_AUTH_FILE"],
                 max_workers=app.config["SKOPEO_MAX_WORKERS"],

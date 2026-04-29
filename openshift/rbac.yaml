@@ -18,6 +18,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "namespaces", "nodes"]
     verbs: ["get", "list"]
+  # Exec into pods for runtime cgroups v1 detection (Level 3)
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
   # Read ImagePullSecrets and ServiceAccounts for registry auth
   - apiGroups: [""]
     resources: ["secrets", "serviceaccounts"]
@@ -37,6 +41,26 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: cgroups-v2-checker
+subjects:
+  - kind: ServiceAccount
+    name: cgroups-v2-checker
+    namespace: cgroups-v2-checker
+---
+# Allow the scanner SA to pull images from the internal OpenShift registry
+# in any namespace, so skopeo can inspect imagestreams from user namespaces
+# (not just `openshift/`). The scanner already authenticates to the internal
+# registry using its own ServiceAccount token; this binding grants the
+# necessary authorization (image pull) cluster-wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cgroups-v2-checker-image-puller
+  labels:
+    app.kubernetes.io/name: cgroups-v2-checker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:image-puller
 subjects:
   - kind: ServiceAccount
     name: cgroups-v2-checker

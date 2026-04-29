@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Set, Tuple
 try:
     from kubernetes import client, config
     from kubernetes.client.rest import ApiException
+    from kubernetes.stream import stream as k8s_stream
 except ImportError:
     raise ImportError("Package 'kubernetes' not found. Install with: pip install kubernetes")
 
@@ -97,6 +98,40 @@ CGROUPS_V1_FILES = [
     "cpu.cfs_quota_us", "cpu.cfs_period_us", "cpu.shares",
     "cpuacct.usage", "cpuacct.stat",
 ]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pod exec cgroups v1 detection script
+# ─────────────────────────────────────────────────────────────────────────────
+# This script is executed inside running pods to detect cgroups v1 usage
+# at runtime. It checks:
+# 1. Whether the pod runs under cgroups v1 or v2 hierarchy
+# 2. Which v1-specific directories exist in /sys/fs/cgroup
+# 3. Application files that reference v1-specific paths (with timeout & depth limit)
+# 4. Environment variables referencing cgroups v1
+#
+# Performance: script uses a single combined grep with maxdepth=3, size<1MB,
+# and a 5-second timeout to avoid hanging on large containers.
+_EXEC_CHECK_SCRIPT = (
+    'echo "===TYPE===";'
+    '[ -f /sys/fs/cgroup/cgroup.controllers ] && echo "v2" || echo "v1";'
+    'echo "===V1DIRS===";'
+    'for d in memory cpu cpuacct blkio pids devices freezer cpuset '
+    'hugetlb net_cls net_prio perf_event; do'
+    ' [ -d "/sys/fs/cgroup/$d" ] && echo "/sys/fs/cgroup/$d";'
+    'done;'
+    'echo "===V1REFS===";'
+    # Single find+grep: maxdepth 3, text files <1MB, 5s timeout
+    'timeout 5 find /etc /opt /app /home -maxdepth 3 -type f -size -1M '
+    '-exec grep -lE "sys/fs/cgroup/(memory|cpu|cpuacct|blkio)/|'
+    'memory\\.limit_in_bytes|cpu\\.cfs_quota_us|cpu\\.shares|cpuacct\\." {} + '
+    '2>/dev/null | head -20 || true;'
+    'echo "===ENVREF===";'
+    'cat /proc/1/environ 2>/dev/null | tr "\\0" "\\n" | grep -i cgroup 2>/dev/null || true;'
+    'echo "===DONE==="'
+)
+
+_EXEC_MAX_WORKERS = int(os.environ.get("EXEC_MAX_WORKERS", "10"))
+_EXEC_TIMEOUT = 15
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,6 +259,7 @@ class CGroupsV2Scanner:
         exclude_patterns: Optional[List[str]] = None,
         skip_system_ns: bool = True,
         inspect_images: bool = True,
+        exec_check: bool = False,
         skopeo_tls_verify: bool = True,
         skopeo_auth_file: str = "",
         max_workers: int = 20,
@@ -237,6 +273,7 @@ class CGroupsV2Scanner:
         self._ns_exclude_patterns = self._compile_patterns(exclude_patterns)
         self.skip_system_ns = skip_system_ns
         self.inspect_images = inspect_images
+        self.exec_check = exec_check
         self.skopeo_tls_verify = skopeo_tls_verify
         self.skopeo_auth_file = skopeo_auth_file
         self.max_workers = max_workers
@@ -251,6 +288,8 @@ class CGroupsV2Scanner:
         self._registry_auths: Dict[str, dict] = {}
         # Tracks which image pull secrets have already been processed
         self._processed_pull_secrets: Set[str] = set()
+        # Map image -> (namespace, pod_name, container_name) for exec checks
+        self._image_pod_map: Dict[str, Tuple[str, str, str]] = {}
 
     @staticmethod
     def _compile_patterns(patterns: Optional[List[str]]) -> List[re.Pattern]:
@@ -520,6 +559,7 @@ class CGroupsV2Scanner:
         skipped_excluded = 0
         skipped_system = 0
         skipped_pattern = 0
+        skipped_not_running = 0
 
         for pod in all_pods:
             ns = pod.metadata.namespace
@@ -534,6 +574,15 @@ class CGroupsV2Scanner:
             if not self._namespace_included(ns):
                 skipped += 1
                 skipped_pattern += 1
+                continue
+
+            # Only consider pods in Running phase. Pods in Pending, Succeeded,
+            # Failed or Unknown phases are skipped to avoid noise from images
+            # that aren't actively running on the cluster.
+            is_running = bool(pod.status and pod.status.phase == "Running")
+            if not is_running:
+                skipped += 1
+                skipped_not_running += 1
                 continue
 
             total_pods += 1
@@ -567,6 +616,9 @@ class CGroupsV2Scanner:
                     r.namespaces.add(ns)
                     r.pods.add(f"{ns}/{pod_name}")
                     r.containers.add(c.name)
+                    # Track first running pod per image for exec checks
+                    if is_running and img not in self._image_pod_map:
+                        self._image_pod_map[img] = (ns, pod_name, c.name)
 
         # Mark images that appear ONLY in initContainers
         for report in self.image_reports.values():
@@ -581,6 +633,8 @@ class CGroupsV2Scanner:
             skip_parts.append(f"excluded namespaces: {skipped_excluded}")
         if skipped_pattern > 0:
             skip_parts.append(f"pattern filter: {skipped_pattern}")
+        if skipped_not_running > 0:
+            skip_parts.append(f"not running: {skipped_not_running}")
         if skip_parts:
             self.cluster_info["pods_skipped"] = f"{skipped} ({', '.join(skip_parts)})"
         else:
@@ -616,6 +670,10 @@ class CGroupsV2Scanner:
         # Level 2: skopeo remote inspection (with cache)
         if self.inspect_images and self._check_skopeo():
             self._skopeo_inspect_all()
+
+        # Level 3: pod exec cgroups v1 runtime detection
+        if self.exec_check:
+            self._exec_check_all()
 
         # Post-processing: reduce severity for initContainer-only images
         self._apply_init_container_severity_downgrade()
@@ -797,19 +855,24 @@ class CGroupsV2Scanner:
         if not self.skopeo_tls_verify or is_internal:
             cmd.append("--tls-verify=false")
 
-        # Auth file priority:
-        # 1. Explicit auth file from config (global)
-        # 2. Dynamically built auth from ImagePullSecrets
-        # 3. ServiceAccount token for internal registry
-        if self.skopeo_auth_file:
+        # Auth selection:
+        # - For the OpenShift internal registry, always use the scanner's own
+        #   ServiceAccount token (granted system:image-puller cluster-wide).
+        #   We must NOT pass --authfile here, because pull-secret tokens
+        #   harvested from pods are SA tokens scoped to a single namespace,
+        #   which would shadow our cluster-wide token and cause
+        #   "authentication required" for imagestreams in other namespaces.
+        # - For external registries, use (in order): explicit global authfile,
+        #   then a temp authfile built from ImagePullSecrets / saved registry
+        #   credentials.
+        if is_internal and self._sa_token:
+            cmd.extend(["--creds", f"serviceaccount:{self._sa_token}"])
+        elif self.skopeo_auth_file:
             cmd.extend(["--authfile", self.skopeo_auth_file])
         elif self._registry_auths:
             tmp_auth_file = self._build_auth_file_for_image(image)
             if tmp_auth_file:
                 cmd.extend(["--authfile", tmp_auth_file])
-
-        if self._sa_token and is_internal:
-            cmd.extend(["--creds", f"serviceaccount:{self._sa_token}"])
 
         # Normalize image reference for skopeo.
         # Images with both tag and digest (e.g. image:v4.18@sha256:abc) cause
@@ -991,6 +1054,135 @@ class CGroupsV2Scanner:
                         f"Label: com.redhat.component={rh_comp}"))
 
     # ─────────────────────────────────────────────────────────────────────
+    # Level 3: pod exec cgroups v1 runtime detection
+    # ─────────────────────────────────────────────────────────────────────
+    def _exec_check_all(self):
+        """Execute a cgroups v1 detection script inside running pods.
+
+        Picks one running pod per unique image and runs a shell script
+        that checks for cgroups v1 paths, file references, and
+        environment variables inside the container.
+        """
+        # Only check images that have a running pod with a regular container
+        exec_targets = {
+            img: pod_info
+            for img, pod_info in self._image_pod_map.items()
+            if img in self.image_reports
+        }
+
+        if not exec_targets:
+            logger.info("Exec check: no running pods available for exec")
+            return
+
+        total = len(exec_targets)
+        logger.info(f"Exec check: {total} images to inspect via pod exec "
+                     f"({_EXEC_MAX_WORKERS} workers, {_EXEC_TIMEOUT}s timeout)")
+
+        with ThreadPoolExecutor(max_workers=_EXEC_MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(self._exec_check_one, img, ns, pod_name, container):
+                img for img, (ns, pod_name, container) in exec_targets.items()
+            }
+            done = 0
+            for future in as_completed(futures):
+                done += 1
+                img = futures[future]
+                self._report_progress("exec_check", done, total,
+                    f"Pod exec ({done}/{total}): {img[:60]}")
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.debug(f"Exec check failed for {img}: {e}")
+
+        exec_ok = sum(1 for img in exec_targets
+                      if any(f.category.startswith("Runtime Check")
+                             for f in self.image_reports[img].findings))
+        self.cluster_info["exec_checked"] = str(total)
+        logger.info(f"Exec check: completed {total} pods, {exec_ok} with findings")
+
+    def _exec_check_one(self, image: str, namespace: str, pod_name: str, container: str):
+        """Execute the cgroups v1 check script inside a single pod container."""
+        report = self.image_reports[image]
+
+        try:
+            output = k8s_stream(
+                self.v1.connect_get_namespaced_pod_exec,
+                pod_name, namespace,
+                container=container,
+                command=["/bin/sh", "-c", _EXEC_CHECK_SCRIPT],
+                stderr=True, stdin=False, stdout=True, tty=False,
+                _request_timeout=_EXEC_TIMEOUT,
+            )
+        except ApiException as e:
+            if e.status == 403:
+                logger.debug(f"Exec forbidden for {namespace}/{pod_name}: {e.reason}")
+            else:
+                logger.debug(f"Exec failed for {namespace}/{pod_name}: {e}")
+            return
+        except Exception as e:
+            logger.debug(f"Exec error for {namespace}/{pod_name}/{container}: {e}")
+            return
+
+        if not output or "===DONE===" not in output:
+            logger.debug(f"Exec incomplete output for {namespace}/{pod_name}/{container}")
+            return
+
+        self._parse_exec_output(report, output, namespace, pod_name, container)
+
+    def _parse_exec_output(self, report: ImageReport, output: str,
+                           namespace: str, pod_name: str, container: str):
+        """Parse the output of the cgroups v1 exec check script."""
+        sections = {}
+        current_section = None
+        current_lines = []
+
+        for line in output.splitlines():
+            line = line.strip()
+            if line.startswith("===") and line.endswith("==="):
+                if current_section:
+                    sections[current_section] = current_lines
+                current_section = line.strip("=")
+                current_lines = []
+            elif current_section:
+                if line:
+                    current_lines.append(line)
+
+        if current_section:
+            sections[current_section] = current_lines
+
+        pod_ref = f"{namespace}/{pod_name}:{container}"
+
+        # Check for v1 file references inside the application
+        v1_refs = sections.get("V1REFS", [])
+        if v1_refs:
+            # Deduplicate file paths
+            unique_refs = sorted(set(v1_refs))
+            report.findings.append(Finding(
+                "Runtime Check (exec)", "HIGH",
+                f"Application files reference cgroups v1 paths inside the container",
+                "Update the application to use cgroups v2 unified hierarchy paths. "
+                "Example: /sys/fs/cgroup/memory.max instead of "
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                f"Files found in {pod_ref}: {', '.join(unique_refs[:10])}"
+                + (f" (+{len(unique_refs) - 10} more)" if len(unique_refs) > 10 else ""),
+            ))
+
+        # Check for cgroups v1 references in environment variables
+        env_refs = sections.get("ENVREF", [])
+        cgroup_v1_env = [e for e in env_refs if any(
+            v1 in e for v1 in ["/sys/fs/cgroup/memory/", "/sys/fs/cgroup/cpu/",
+                                "memory.limit_in_bytes", "cpu.cfs_quota_us",
+                                "cpu.shares", "cpuacct."]
+        )]
+        if cgroup_v1_env:
+            report.findings.append(Finding(
+                "Runtime Check (exec)", "MEDIUM",
+                "Environment variables reference cgroups v1 paths",
+                "Update environment variables to use cgroups v2 paths.",
+                f"Pod {pod_ref}: {'; '.join(cgroup_v1_env[:5])}",
+            ))
+
+    # ─────────────────────────────────────────────────────────────────────
     # Report generation
     # ─────────────────────────────────────────────────────────────────────
     def _apply_init_container_severity_downgrade(self):
@@ -1037,7 +1229,7 @@ class CGroupsV2Scanner:
             "init_only_images": init_only,
             "inspected_via_skopeo": sum(1 for r in self.image_reports.values() if r.inspected),
             "skopeo_errors": sum(1 for r in self.image_reports.values() if r.inspection_error),
-
+            "exec_checked": int(self.cluster_info.get("exec_checked", 0)),
             "by_severity": dict(by_severity),
         }
 

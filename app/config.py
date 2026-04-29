@@ -32,3 +32,7 @@ class Config:
 
     # Report storage
     REPORT_DIR = os.environ.get("REPORT_DIR", "/app/data/reports")
+
+    # Path to a mounted registries file (e.g. from a Kubernetes Secret)
+    # If set and file exists, registries are loaded from this file on startup
+    REGISTRIES_FILE = os.environ.get("REGISTRIES_FILE", "")
