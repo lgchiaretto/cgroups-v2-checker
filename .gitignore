@@ -383,6 +383,12 @@ tags
 # Virtualenv
 # http://iamzed.com/2009/05/07/a-primer-on-virtualenv/
 
+### Cursor ###
+.cursor/*
+!.cursor/rules/
+!.cursor/settings.json
+!.cursor/tasks.json
+
 ### VisualStudioCode ###
 .vscode/*
 !.vscode/settings.json
@@ -391,15 +397,11 @@ tags
 !.vscode/extensions.json
 !.vscode/*.code-snippets
 
-# Local History for Visual Studio Code
+# Local History
 .history/
 
-# Built Visual Studio Code Extensions
 *.vsix
 
-### VisualStudioCode Patch ###
-# Ignore all local history of files
-.history
 .ionide
 
 ### Windows ###

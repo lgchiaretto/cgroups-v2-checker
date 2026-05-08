@@ -168,6 +168,7 @@ class ImageReport:
     inspected: bool = False
     inspection_error: str = ""
     only_in_init: bool = False
+    inspection_metadata: Dict = field(default_factory=dict)
 
     @property
     def max_severity(self) -> str:
@@ -184,7 +185,7 @@ class ImageReport:
         return order.get(self.max_severity, 99)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "image": self.image,
             "max_severity": self.max_severity,
             "namespaces": sorted(self.namespaces),
@@ -197,6 +198,9 @@ class ImageReport:
             "inspection_error": self.inspection_error,
             "findings": [f.to_dict() for f in self.findings],
         }
+        if self.inspection_metadata:
+            d["inspection_metadata"] = self.inspection_metadata
+        return d
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -926,6 +930,9 @@ class CGroupsV2Scanner:
         cmd = data.get("Cmd") or []
         entrypoint = data.get("Entrypoint") or []
 
+        metadata = self._build_inspection_metadata(labels, env_list, cmd, entrypoint)
+        report.inspection_metadata = metadata
+
         # Base image from OCI labels
         base_image = (
             labels.get("org.opencontainers.image.base.name", "")
@@ -979,6 +986,64 @@ class CGroupsV2Scanner:
                 jm = re.match(r"JAVA_VERSION=(.+)", env_var)
                 if jm:
                     self._check_java_env(report, jm.group(1))
+
+        if not report.findings and not metadata.get("has_base_image_label") and not metadata.get("has_os_labels"):
+            report.findings.append(Finding(
+                "Insufficient Metadata (skopeo)", "LOW",
+                "Image has no base image labels or OS identification — cannot validate via metadata alone",
+                "Run scan with exec_check enabled, or add OCI labels "
+                "(org.opencontainers.image.base.name, com.redhat.component) to the image.",
+                f"Labels found: {metadata.get('label_count', 0)}, "
+                f"ENV vars: {metadata.get('env_count', 0)}",
+            ))
+
+    @staticmethod
+    def _build_inspection_metadata(labels: dict, env_list: list,
+                                   cmd: list, entrypoint: list) -> dict:
+        """Summarize what skopeo returned for audit trail purposes."""
+        # Collect relevant label keys that help identify base image / OS
+        os_label_keys = {
+            "org.opencontainers.image.base.name", "base-image",
+            "io.openshift.build.image", "com.redhat.component",
+            "org.opencontainers.image.version", "version",
+            "release", "name", "summary", "description",
+            "org.opencontainers.image.title",
+        }
+        found_labels = {k: v for k, v in labels.items() if k in os_label_keys and v}
+
+        base_label = (
+            labels.get("org.opencontainers.image.base.name", "")
+            or labels.get("base-image", "")
+            or labels.get("io.openshift.build.image", "")
+        )
+
+        has_os_labels = bool(
+            labels.get("com.redhat.component")
+            or labels.get("org.opencontainers.image.base.name")
+            or labels.get("base-image")
+            or labels.get("release")
+        )
+
+        env_relevant = []
+        for e in env_list:
+            if isinstance(e, str):
+                key = e.split("=", 1)[0] if "=" in e else e
+                if key in ("JAVA_VERSION", "JAVA_HOME", "NODE_VERSION",
+                           "PYTHON_VERSION", "DOTNET_VERSION", "GOLANG_VERSION",
+                           "PATH", "HOME"):
+                    env_relevant.append(e)
+
+        metadata = {
+            "label_count": len(labels),
+            "env_count": len(env_list),
+            "has_base_image_label": bool(base_label),
+            "has_os_labels": has_os_labels,
+            "relevant_labels": found_labels if found_labels else None,
+            "relevant_env": env_relevant if env_relevant else None,
+            "has_cmd": bool(cmd),
+            "has_entrypoint": bool(entrypoint),
+        }
+        return {k: v for k, v in metadata.items() if v is not None}
 
     def _check_java_env(self, report: ImageReport, ver_str: str):
         ver = ver_str.strip()
