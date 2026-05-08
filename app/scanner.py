@@ -294,6 +294,7 @@ class CGroupsV2Scanner:
         self._processed_pull_secrets: Set[str] = set()
         # Map image -> (namespace, pod_name, container_name) for exec checks
         self._image_pod_map: Dict[str, Tuple[str, str, str]] = {}
+        self._api_client: Optional[client.ApiClient] = None
 
     @staticmethod
     def _compile_patterns(patterns: Optional[List[str]]) -> List[re.Pattern]:
@@ -341,9 +342,27 @@ class CGroupsV2Scanner:
             config.load_kube_config()
             logger.info("Using local kubeconfig.")
 
-        self.v1 = client.CoreV1Api()
+        # Kubernetes client >= 28 falls back to HTTPS_PROXY env var when
+        # Configuration.proxy is None. Force direct connection to prevent
+        # multi-minute timeouts when the proxy can't reach the API server.
+        proxy_env = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or \
+                    os.environ.get("https_proxy") or os.environ.get("http_proxy")
+        if proxy_env:
+            logger.info("HTTP(S)_PROXY detected; forcing direct connection to K8s API.")
+            saved = {}
+            for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                if var in os.environ:
+                    saved[var] = os.environ.pop(var)
+            api_client = client.ApiClient()
+            for var, val in saved.items():
+                os.environ[var] = val
+        else:
+            api_client = client.ApiClient()
 
-        version_api = client.VersionApi()
+        self._api_client = api_client
+        self.v1 = client.CoreV1Api(api_client)
+
+        version_api = client.VersionApi(api_client)
         version = version_api.get_code()
         self.cluster_info["kubernetes_version"] = version.git_version
         logger.info(f"Connected: Kubernetes {version.git_version}")
@@ -363,7 +382,7 @@ class CGroupsV2Scanner:
 
     def _check_openshift(self):
         try:
-            custom = client.CustomObjectsApi()
+            custom = client.CustomObjectsApi(self._api_client)
             cv = custom.get_cluster_custom_object(
                 "config.openshift.io", "v1", "clusterversions", "version",
             )
@@ -375,7 +394,7 @@ class CGroupsV2Scanner:
 
     def _discover_internal_registry(self):
         try:
-            custom = client.CustomObjectsApi()
+            custom = client.CustomObjectsApi(self._api_client)
             ic = custom.get_cluster_custom_object(
                 "config.openshift.io", "v1", "images", "cluster",
             )
