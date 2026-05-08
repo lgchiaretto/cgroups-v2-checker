@@ -143,18 +143,17 @@ build_image() {
         build_args+=(--build-arg "https_proxy=${PROXY_URL}")
         build_args+=(--build-arg "no_proxy=${NO_PROXY_HOSTS:-$DEFAULT_NO_PROXY}")
     fi
+
+    # Always create .build-ca.pem (empty if no CA, real cert if provided)
     if [[ -n "$CUSTOM_CA_PATH" ]]; then
-        local ca_filename
-        ca_filename=$(basename "$CUSTOM_CA_PATH")
-        cp "$CUSTOM_CA_PATH" "${SCRIPT_DIR}/${ca_filename}"
-        build_args+=(--build-arg "CUSTOM_CA=${ca_filename}")
-        log_info "Custom CA certificate: ${ca_filename}"
+        cp "$CUSTOM_CA_PATH" "${SCRIPT_DIR}/.build-ca.pem"
+        log_info "Custom CA certificate: ${CUSTOM_CA_PATH}"
+    else
+        : > "${SCRIPT_DIR}/.build-ca.pem"
     fi
+
     podman build "${build_args[@]}" -t "${IMAGE_REF}" -f Containerfile .
-    # Clean up copied CA file
-    if [[ -n "$CUSTOM_CA_PATH" ]]; then
-        rm -f "${SCRIPT_DIR}/$(basename "$CUSTOM_CA_PATH")"
-    fi
+    rm -f "${SCRIPT_DIR}/.build-ca.pem"
     log_success "Image built successfully: ${IMAGE_REF}"
 }
 

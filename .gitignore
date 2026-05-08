@@ -383,6 +383,9 @@ tags
 # Virtualenv
 # http://iamzed.com/2009/05/07/a-primer-on-virtualenv/
 
+# Build artifacts
+.build-ca.pem
+
 ### Cursor ###
 .cursor/*
 !.cursor/rules/

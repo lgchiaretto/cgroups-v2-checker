@@ -4,3 +4,4 @@
 !gunicorn.conf.py
 !run.py
 !app
+!.build-ca.pem
