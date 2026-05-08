@@ -519,11 +519,11 @@ persist_registries() {
     # Check prerequisites
     if ! command -v oc &> /dev/null; then
         log_error "OpenShift CLI (oc) not found."
-        exit 1
+        return 1
     fi
     if ! oc whoami &> /dev/null; then
         log_error "Not logged into OpenShift. Please run 'oc login' first."
-        exit 1
+        return 1
     fi
 
     SECRET_NAME="${APP_NAME}-registries"
@@ -543,14 +543,14 @@ persist_registries() {
                 log_warn "No registry credentials found in the running pod."
                 log_info "Add credentials via the web UI first, then run this command again."
                 rm -f "${REG_FILE}"
-                exit 1
+                return 1
             fi
             log_success "Found ${REG_COUNT} registry credential(s)"
         else
             log_warn "Could not read registries from running pod."
             log_info "Add credentials via the web UI first, then run this command again."
             rm -f "${REG_FILE}"
-            exit 1
+            return 1
         fi
     else
         log_warn "No running pod found in namespace ${NAMESPACE}."
@@ -560,8 +560,8 @@ persist_registries() {
         echo
 
         if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
-            log_info "Cancelled."
-            exit 0
+            log_info "Skipping --persistent."
+            return 0
         fi
 
         # Interactive credential entry
@@ -596,8 +596,8 @@ print(json.dumps(data))
 
         REG_COUNT=$(echo "${REGISTRIES}" | python3 -c "import json, sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
         if [[ "${REG_COUNT}" == "0" ]]; then
-            log_info "No credentials entered. Cancelled."
-            exit 0
+            log_info "No credentials entered. Skipping --persistent."
+            return 0
         fi
 
         echo "${REGISTRIES}" > "${REG_FILE}"
@@ -804,5 +804,5 @@ run_action() {
 }
 
 for action in "${ACTIONS[@]}"; do
-    run_action "$action"
+    run_action "$action" || true
 done
