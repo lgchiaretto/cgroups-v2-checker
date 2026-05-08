@@ -52,4 +52,5 @@ OpenShift cgroups v2 scanner — Flask web app that scans clusters for container
 - `inspection_metadata` in report JSON shows what skopeo found (audit trail)
 - `--mirror` pushes to OCP internal registry (bypasses proxy/TLS)
 - `--proxy auto` reads proxy from `oc get proxy cluster`
+- `--deploy` auto-seeds registry creds from cluster pull-secret on first deploy
 - Test locally: `python run.py` on port 8080

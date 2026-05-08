@@ -179,7 +179,9 @@ Actions:
 
   OpenShift Deployment:
     --push                 Push image to Quay.io
-    --deploy               Deploy to OpenShift (apply manifests)
+    --deploy               Deploy to OpenShift (apply manifests).
+                           On first deploy, auto-seeds registry
+                           credentials from the cluster pull-secret.
     --build-push-deploy    Full pipeline: build, push, deploy, restart
     --restart              Restart the OpenShift deployment
     --persistent           Persist registry credentials to a K8s Secret
@@ -187,6 +189,14 @@ Actions:
     --openshift-logs       Tail OpenShift deployment logs
     --remove               Completely remove app from OpenShift
 ```
+
+**Auto-seeded registry credentials:**
+
+On the first `--deploy`, the script automatically extracts credentials from the cluster's global pull-secret (`openshift-config/pull-secret`) and creates a Kubernetes Secret with `registries.json`. This gives the scanner immediate access to `registry.redhat.io`, `quay.io`, and other registries configured in the cluster — no manual credential setup needed.
+
+- Requires read access to `openshift-config/pull-secret` (typically cluster-admin)
+- Skipped if the credentials Secret already exists (preserves user-added credentials)
+- Additional registries can be added via the web UI and persisted with `--persistent`
 
 **How `--mirror` works:**
 

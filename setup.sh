@@ -30,7 +30,10 @@
 #
 #   OpenShift Deployment:
 #     --push                 Push image to Quay.io
-#     --deploy               Deploy to OpenShift (apply manifests)
+#     --deploy               Deploy to OpenShift (apply manifests).
+#                            On first deploy, auto-seeds registry
+#                            credentials from the cluster pull-secret
+#                            (registry.redhat.io, quay.io, etc.).
 #     --build-push-deploy    Full pipeline: build, push, deploy, restart
 #     --restart              Restart the OpenShift deployment
 #     --persistent           Persist registry credentials to a K8s Secret
@@ -61,7 +64,7 @@ NAMESPACE="${APP_NAME}"
 # Proxy settings (set via --proxy flag)
 PROXY_URL=""
 NO_PROXY_HOSTS=""
-DEFAULT_NO_PROXY=".cluster.local,.svc,10.128.0.0/14,172.30.0.0/16,localhost,127.0.0.1"
+ESSENTIAL_NO_PROXY=".cluster.local,.svc,localhost,127.0.0.1"
 
 # Mirror mode: push to internal registry instead of quay.io
 MIRROR_MODE=false
@@ -99,6 +102,54 @@ show_help() {
     exit 0
 }
 
+# Detect Kubernetes/OpenShift service and pod CIDRs for NO_PROXY
+detect_cluster_cidrs() {
+    local cidrs=""
+
+    # Service CIDR: read from Kubernetes API server IP or network config
+    local api_ip
+    api_ip=$(oc get svc kubernetes -n default -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+    if [[ -n "$api_ip" ]]; then
+        local svc_cidr
+        svc_cidr=$(oc get network.config cluster -o jsonpath='{.status.serviceNetwork[0]}' 2>/dev/null)
+        if [[ -n "$svc_cidr" ]]; then
+            cidrs="${svc_cidr}"
+        else
+            # Fallback: use /16 from the API server IP
+            local base
+            base=$(echo "$api_ip" | cut -d. -f1-2)
+            cidrs="${base}.0.0/16"
+        fi
+    fi
+
+    # Pod CIDR
+    local pod_cidr
+    pod_cidr=$(oc get network.config cluster -o jsonpath='{.status.clusterNetwork[0].cidr}' 2>/dev/null)
+    if [[ -n "$pod_cidr" ]]; then
+        cidrs="${cidrs:+$cidrs,}${pod_cidr}"
+    fi
+
+    echo "$cidrs"
+}
+
+# Merge NO_PROXY lists, deduplicating entries
+merge_no_proxy() {
+    local merged=""
+    local seen=""
+    for list in "$@"; do
+        IFS=',' read -ra items <<< "$list"
+        for item in "${items[@]}"; do
+            item=$(echo "$item" | xargs)  # trim whitespace
+            [[ -z "$item" ]] && continue
+            if [[ ",$seen," != *",$item,"* ]]; then
+                merged="${merged:+$merged,}${item}"
+                seen="${seen:+$seen,}${item}"
+            fi
+        done
+    done
+    echo "$merged"
+}
+
 # Auto-detect proxy from the OpenShift cluster Proxy object
 detect_cluster_proxy() {
     if ! command -v oc &> /dev/null || ! oc whoami &> /dev/null 2>&1; then
@@ -118,14 +169,21 @@ detect_cluster_proxy() {
     fi
 
     PROXY_URL="${https_proxy:-$http_proxy}"
-    if [[ -n "$no_proxy" && -z "$NO_PROXY_HOSTS" ]]; then
-        NO_PROXY_HOSTS="$no_proxy"
+
+    # Auto-detect cluster CIDRs (service network, pod network)
+    local cluster_cidrs
+    cluster_cidrs=$(detect_cluster_cidrs)
+
+    if [[ -z "$NO_PROXY_HOSTS" ]]; then
+        # Merge: cluster noProxy + auto-detected CIDRs + essential entries
+        NO_PROXY_HOSTS=$(merge_no_proxy "$no_proxy" "$cluster_cidrs" "$ESSENTIAL_NO_PROXY")
+    else
+        # User provided --no-proxy: merge with CIDRs + essentials
+        NO_PROXY_HOSTS=$(merge_no_proxy "$NO_PROXY_HOSTS" "$cluster_cidrs" "$ESSENTIAL_NO_PROXY")
     fi
 
     log_success "Auto-detected cluster proxy: ${PROXY_URL}"
-    if [[ -n "$NO_PROXY_HOSTS" ]]; then
-        log_info "NO_PROXY: ${NO_PROXY_HOSTS}"
-    fi
+    log_info "NO_PROXY: ${NO_PROXY_HOSTS}"
     return 0
 }
 
@@ -141,7 +199,7 @@ build_image() {
         log_info "Using proxy for build: ${PROXY_URL}"
         build_args+=(--build-arg "http_proxy=${PROXY_URL}")
         build_args+=(--build-arg "https_proxy=${PROXY_URL}")
-        build_args+=(--build-arg "no_proxy=${NO_PROXY_HOSTS:-$DEFAULT_NO_PROXY}")
+        build_args+=(--build-arg "no_proxy=${NO_PROXY_HOSTS:-$ESSENTIAL_NO_PROXY}")
     fi
 
     # Always create .build-ca.pem (empty if no CA, real cert if provided)
@@ -295,7 +353,7 @@ push_image() {
     if [[ -n "$PROXY_URL" ]]; then
         log_info "Using proxy for push: ${PROXY_URL}"
         HTTPS_PROXY="$PROXY_URL" HTTP_PROXY="$PROXY_URL" \
-            NO_PROXY="${NO_PROXY_HOSTS:-$DEFAULT_NO_PROXY}" \
+            NO_PROXY="${NO_PROXY_HOSTS:-$ESSENTIAL_NO_PROXY}" \
             podman push "${IMAGE_REF}"
     else
         podman push "${IMAGE_REF}"
@@ -368,6 +426,105 @@ mirror_to_internal() {
     INTERNAL_IMAGE_REF="${svc_image_ref}"
 }
 
+# Auto-populate registry credentials from the cluster's global pull secret.
+# Extracts auths from openshift-config/pull-secret and creates a K8s Secret
+# with registries.json so skopeo can authenticate to registry.redhat.io, quay.io, etc.
+seed_cluster_registries() {
+    local secret_name="${APP_NAME}-registries"
+
+    # Skip if Secret already exists (preserves user-added credentials)
+    if oc get secret "${secret_name}" -n ${NAMESPACE} &>/dev/null; then
+        log_info "Registry credentials Secret already exists — skipping auto-seed"
+        return 0
+    fi
+
+    log_info "Auto-populating registry credentials from cluster pull-secret..."
+
+    local pull_secret_b64
+    pull_secret_b64=$(oc get secret pull-secret -n openshift-config \
+        -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null) || {
+        log_warn "Could not read cluster pull-secret (need cluster-admin). Skipping auto-seed."
+        return 0
+    }
+
+    if [[ -z "$pull_secret_b64" ]]; then
+        log_warn "Cluster pull-secret is empty. Skipping auto-seed."
+        return 0
+    fi
+
+    local reg_file="/tmp/${APP_NAME}-seed-registries.json"
+
+    echo "$pull_secret_b64" | base64 -d | python3 -c "
+import json, sys, base64
+data = json.load(sys.stdin)
+auths = data.get('auths', {})
+# Registries to skip (telemetry/non-image endpoints)
+skip = {'cloud.openshift.com', 'openshift.org'}
+result = []
+for registry, creds in auths.items():
+    if registry in skip:
+        continue
+    auth = creds.get('auth', '')
+    if not auth:
+        continue
+    try:
+        decoded = base64.b64decode(auth).decode()
+        user, passwd = decoded.split(':', 1)
+        result.append({'registry': registry, 'username': user, 'password': passwd})
+    except Exception:
+        continue
+print(json.dumps(result, indent=2))
+" > "${reg_file}" 2>/dev/null
+
+    local count
+    count=$(python3 -c "import json; print(len(json.load(open('${reg_file}'))))" 2>/dev/null || echo "0")
+
+    if [[ "$count" == "0" ]]; then
+        log_warn "No registry credentials found in cluster pull-secret."
+        rm -f "${reg_file}"
+        return 0
+    fi
+
+    log_success "Found ${count} registry credential(s) from cluster pull-secret"
+
+    # Create the Secret
+    oc create secret generic "${secret_name}" \
+        --from-file=registries.json="${reg_file}" \
+        -n ${NAMESPACE} 2>/dev/null || {
+        log_warn "Could not create registry credentials Secret."
+        rm -f "${reg_file}"
+        return 0
+    }
+    rm -f "${reg_file}"
+
+    # Patch deployment to mount the secret
+    oc patch deployment/${APP_NAME} -n ${NAMESPACE} --type=json -p '[
+        {"op": "add", "path": "/spec/template/spec/volumes/-", "value": {
+            "name": "registry-creds",
+            "secret": {"secretName": "'"${secret_name}"'", "optional": true}
+        }},
+        {"op": "add", "path": "/spec/template/spec/containers/0/volumeMounts/-", "value": {
+            "name": "registry-creds",
+            "mountPath": "/app/secrets/registries",
+            "readOnly": true
+        }},
+        {"op": "add", "path": "/spec/template/spec/containers/0/env/-", "value": {
+            "name": "REGISTRIES_FILE",
+            "value": "/app/secrets/registries/registries.json"
+        }}
+    ]' 2>/dev/null || {
+        oc set volume deployment/${APP_NAME} -n ${NAMESPACE} \
+            --add --name=registry-creds \
+            --type=secret --secret-name="${secret_name}" \
+            --mount-path=/app/secrets/registries --read-only \
+            --overwrite 2>/dev/null || true
+        oc set env deployment/${APP_NAME} -n ${NAMESPACE} \
+            REGISTRIES_FILE=/app/secrets/registries/registries.json 2>/dev/null || true
+    }
+
+    log_success "Registry credentials seeded and mounted in deployment"
+}
+
 # Deploy to OpenShift
 deploy_openshift() {
     log_info "Deploying ${APP_NAME} to OpenShift..."
@@ -392,6 +549,9 @@ deploy_openshift() {
     log_info "Applying deployment, service, and route..."
     oc apply -f openshift/deployment.yaml
 
+    # Auto-seed registry credentials from cluster pull-secret (first deploy only)
+    seed_cluster_registries
+
     # If mirroring, switch the deployment image to the internal registry
     if [[ "$MIRROR_MODE" == true && -n "$INTERNAL_IMAGE_REF" ]]; then
         log_info "Patching deployment to use internal image: ${INTERNAL_IMAGE_REF}"
@@ -402,7 +562,7 @@ deploy_openshift() {
 
     # Inject proxy env vars into the deployment if --proxy was provided
     if [[ -n "$PROXY_URL" ]]; then
-        local no_proxy="${NO_PROXY_HOSTS:-$DEFAULT_NO_PROXY}"
+        local no_proxy="${NO_PROXY_HOSTS:-$ESSENTIAL_NO_PROXY}"
         log_info "Injecting proxy into deployment: ${PROXY_URL}"
         oc set env deployment/${APP_NAME} -n ${NAMESPACE} \
             HTTP_PROXY="${PROXY_URL}" \
