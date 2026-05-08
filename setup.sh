@@ -345,7 +345,9 @@ mirror_to_internal() {
     local oc_token
     oc_token=$(oc whoami -t)
     log_info "Logging into internal registry..."
-    podman login --tls-verify=false -u "$(oc whoami)" -p "${oc_token}" "${registry_route}"
+    HTTP_PROXY="" HTTPS_PROXY="" http_proxy="" https_proxy="" \
+        NO_PROXY="*" no_proxy="*" \
+        podman login --tls-verify=false -u "$(oc whoami)" -p "${oc_token}" "${registry_route}"
 
     # Tag and push to internal registry
     INTERNAL_IMAGE_REF="${registry_route}/${NAMESPACE}/${APP_NAME}:${IMAGE_TAG}"
@@ -354,8 +356,10 @@ mirror_to_internal() {
     log_info "Tagging: ${IMAGE_REF} → ${INTERNAL_IMAGE_REF}"
     podman tag "${IMAGE_REF}" "${INTERNAL_IMAGE_REF}"
 
-    log_info "Pushing to internal registry..."
-    podman push --tls-verify=false "${INTERNAL_IMAGE_REF}"
+    log_info "Pushing to internal registry (proxy bypassed)..."
+    HTTP_PROXY="" HTTPS_PROXY="" http_proxy="" https_proxy="" \
+        NO_PROXY="*" no_proxy="*" \
+        podman push --tls-verify=false "${INTERNAL_IMAGE_REF}"
 
     log_success "Image mirrored to internal registry"
     log_info "Internal ref: ${svc_image_ref}"
