@@ -712,7 +712,7 @@ remove_openshift() {
 # Main Script — parse global options, then run action
 # ============================================================================
 
-ACTION=""
+ACTIONS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --proxy)
@@ -756,15 +756,11 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --help|-h)
-            ACTION="help"
+            ACTIONS+=("help")
             shift
             ;;
         --*)
-            if [[ -n "$ACTION" ]]; then
-                log_error "Only one action allowed, got both '${ACTION}' and '$1'"
-                exit 1
-            fi
-            ACTION="$1"
+            ACTIONS+=("$1")
             shift
             ;;
         *)
@@ -779,26 +775,34 @@ if [[ -n "$PROXY_URL" ]]; then
     log_info "Proxy configured: ${PROXY_URL}"
 fi
 
-case "${ACTION:-help}" in
-    --build)            build_image ;;
-    --run-local)        run_local ;;
-    --stop)             stop_service ;;
-    --status)           check_status ;;
-    --logs)             show_logs ;;
-    --destroy)          destroy_everything ;;
-    --push)             push_image ;;
-    --mirror-push)      mirror_to_internal ;;
-    --deploy)           deploy_openshift ;;
-    --build-push-deploy) build_push_deploy ;;
-    --restart)          restart_deployment ;;
-    --openshift-status) openshift_status ;;
-    --openshift-logs)   openshift_logs ;;
-    --remove)           remove_openshift ;;
-    --persistent)       persist_registries ;;
-    help)               show_help ;;
-    *)
-        log_error "Unknown action: ${ACTION}"
-        echo "Run '$0 --help' for usage information."
-        exit 1
-        ;;
-esac
+[[ ${#ACTIONS[@]} -eq 0 ]] && ACTIONS=("help")
+
+run_action() {
+    case "$1" in
+        --build)            build_image ;;
+        --run-local)        run_local ;;
+        --stop)             stop_service ;;
+        --status)           check_status ;;
+        --logs)             show_logs ;;
+        --destroy)          destroy_everything ;;
+        --push)             push_image ;;
+        --mirror-push)      mirror_to_internal ;;
+        --deploy)           deploy_openshift ;;
+        --build-push-deploy) build_push_deploy ;;
+        --restart)          restart_deployment ;;
+        --openshift-status) openshift_status ;;
+        --openshift-logs)   openshift_logs ;;
+        --remove)           remove_openshift ;;
+        --persistent)       persist_registries ;;
+        help)               show_help ;;
+        *)
+            log_error "Unknown action: $1"
+            echo "Run '$0 --help' for usage information."
+            exit 1
+            ;;
+    esac
+}
+
+for action in "${ACTIONS[@]}"; do
+    run_action "$action"
+done
