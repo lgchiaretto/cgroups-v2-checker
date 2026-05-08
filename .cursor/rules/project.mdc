@@ -1,0 +1,49 @@
+---
+description: Project architecture, tech stack, and coding standards for the cgroups v2 checker
+alwaysApply: true
+---
+
+# cgroups v2 Compatibility Checker
+
+OpenShift cgroups v2 scanner — Flask web app that scans clusters for container images with cgroups v2 compatibility issues before upgrading to OCP 4.19.
+
+## Tech Stack
+
+- **Backend**: Python 3.11, Flask 3.x, Gunicorn
+- **Frontend**: PatternFly 6 (dark theme), vanilla JS (no frameworks)
+- **Container**: Podman, UBI 9 base, skopeo for image inspection
+- **Platform**: Red Hat OpenShift, deployed via `oc` CLI
+- **Registry**: `quay.io/chiaretto/cgroups-v2-checker`
+
+## Architecture
+
+- `app/scanner.py` — Core scan engine (K8s API + skopeo). 3 levels: name/tag analysis, skopeo remote inspection, pod exec runtime detection
+- `app/api.py` — REST API (`/api/scan`, `/api/reports`). Scans run async in background thread
+- `app/routes.py` — Web routes (HTML pages, CSV download)
+- `app/app.py` — Flask factory
+- `app/config.py` — Config from env vars
+- `app/templates/` — Jinja2, always extend `base.html`
+- `app/static/` — PatternFly 6 dark theme CSS, vanilla JS
+- `openshift/` — K8s/OCP manifests (Deployment, Service, Route, RBAC)
+
+## Coding Standards
+
+- **Python**: PEP 8, type hints, docstrings on public functions
+- **JavaScript**: Vanilla JS only. `var` for compatibility. PatternFly 6 CSS classes (`pf-v6-c-*`)
+- **HTML/CSS**: OpenShift Console-style dark theme
+- **API**: RESTful JSON under `/api/`
+
+## Build & Deploy
+
+```bash
+./setup.sh --build-push-deploy   # Full pipeline
+./setup.sh --restart             # Rollout restart
+```
+
+## Key Patterns
+
+- Paginated K8s pod listing (`_K8S_PAGE_SIZE = 500`)
+- ImagePullSecrets extracted from pods/ServiceAccounts for private registry auth
+- Reports stored as JSON in `REPORT_DIR` (default: `/app/data/reports`)
+- initContainer-only images get severity downgraded one level
+- Test locally: `python run.py` on port 8080
