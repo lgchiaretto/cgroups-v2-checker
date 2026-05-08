@@ -6,9 +6,18 @@
 # application using Podman and OpenShift CLI.
 #
 # Usage:
-#   ./setup.sh [options]
+#   ./setup.sh [global options] <action>
 #
-# Options:
+# Global Options:
+#   --proxy <URL|auto>       Set HTTP/HTTPS proxy (used in build, push,
+#                            and injected into the OpenShift deployment).
+#                            Use "auto" to read from cluster Proxy object.
+#   --no-proxy <hosts>       Comma-separated NO_PROXY hosts (optional,
+#                            auto-detected from cluster or uses defaults)
+#   --mirror                 Push image to the OCP internal registry
+#                            instead of Quay.io (avoids proxy/TLS issues)
+#
+# Actions:
 #   Local Development:
 #     --build                Build the container image
 #     --run-local            Run locally with Podman
@@ -47,6 +56,15 @@ IMAGE_REF="${IMAGE_NAME}:${IMAGE_TAG}"
 LOCAL_PORT="${LOCAL_PORT:-8080}"
 NAMESPACE="${APP_NAME}"
 
+# Proxy settings (set via --proxy flag)
+PROXY_URL=""
+NO_PROXY_HOSTS=""
+DEFAULT_NO_PROXY=".cluster.local,.svc,10.128.0.0/14,172.30.0.0/16,localhost,127.0.0.1"
+
+# Mirror mode: push to internal registry instead of quay.io
+MIRROR_MODE=false
+INTERNAL_IMAGE_REF=""
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -72,8 +90,38 @@ log_error() {
 
 # Show help
 show_help() {
-    head -35 "$0" | tail -33
+    head -40 "$0" | tail -38
     exit 0
+}
+
+# Auto-detect proxy from the OpenShift cluster Proxy object
+detect_cluster_proxy() {
+    if ! command -v oc &> /dev/null || ! oc whoami &> /dev/null 2>&1; then
+        return 1
+    fi
+
+    local proxy_json
+    proxy_json=$(oc get proxy cluster -o json 2>/dev/null) || return 1
+
+    local http_proxy https_proxy no_proxy
+    http_proxy=$(echo "$proxy_json" | python3 -c "import json,sys; p=json.load(sys.stdin).get('spec',{}); print(p.get('httpProxy',''))" 2>/dev/null)
+    https_proxy=$(echo "$proxy_json" | python3 -c "import json,sys; p=json.load(sys.stdin).get('spec',{}); print(p.get('httpsProxy',''))" 2>/dev/null)
+    no_proxy=$(echo "$proxy_json" | python3 -c "import json,sys; p=json.load(sys.stdin).get('spec',{}); print(p.get('noProxy',''))" 2>/dev/null)
+
+    if [[ -z "$http_proxy" && -z "$https_proxy" ]]; then
+        return 1
+    fi
+
+    PROXY_URL="${https_proxy:-$http_proxy}"
+    if [[ -n "$no_proxy" && -z "$NO_PROXY_HOSTS" ]]; then
+        NO_PROXY_HOSTS="$no_proxy"
+    fi
+
+    log_success "Auto-detected cluster proxy: ${PROXY_URL}"
+    if [[ -n "$NO_PROXY_HOSTS" ]]; then
+        log_info "NO_PROXY: ${NO_PROXY_HOSTS}"
+    fi
+    return 0
 }
 
 # ============================================================================
@@ -83,7 +131,14 @@ show_help() {
 # Build container image
 build_image() {
     log_info "Building ${APP_NAME} container image..."
-    podman build -t "${IMAGE_REF}" -f Containerfile .
+    local build_args=()
+    if [[ -n "$PROXY_URL" ]]; then
+        log_info "Using proxy for build: ${PROXY_URL}"
+        build_args+=(--build-arg "http_proxy=${PROXY_URL}")
+        build_args+=(--build-arg "https_proxy=${PROXY_URL}")
+        build_args+=(--build-arg "no_proxy=${NO_PROXY_HOSTS:-$DEFAULT_NO_PROXY}")
+    fi
+    podman build "${build_args[@]}" -t "${IMAGE_REF}" -f Containerfile .
     log_success "Image built successfully: ${IMAGE_REF}"
 }
 
@@ -222,8 +277,76 @@ destroy_everything() {
 # Push image to registry
 push_image() {
     log_info "Pushing image to Quay.io..."
-    podman push "${IMAGE_REF}"
+    if [[ -n "$PROXY_URL" ]]; then
+        log_info "Using proxy for push: ${PROXY_URL}"
+        HTTPS_PROXY="$PROXY_URL" HTTP_PROXY="$PROXY_URL" \
+            NO_PROXY="${NO_PROXY_HOSTS:-$DEFAULT_NO_PROXY}" \
+            podman push "${IMAGE_REF}"
+    else
+        podman push "${IMAGE_REF}"
+    fi
     log_success "Image pushed: ${IMAGE_REF}"
+}
+
+# Push image to the OCP internal registry (bypasses proxy/TLS issues)
+mirror_to_internal() {
+    log_info "Mirroring image to OpenShift internal registry..."
+
+    if ! command -v oc &> /dev/null; then
+        log_error "OpenShift CLI (oc) not found."
+        exit 1
+    fi
+    if ! oc whoami &> /dev/null; then
+        log_error "Not logged into OpenShift. Please run 'oc login' first."
+        exit 1
+    fi
+
+    # Ensure the namespace exists
+    oc apply -f openshift/namespace.yaml 2>/dev/null || true
+
+    # Get the external route for the internal registry
+    local registry_route
+    registry_route=$(oc get route default-route -n openshift-image-registry \
+        -o jsonpath='{.spec.host}' 2>/dev/null || true)
+
+    if [[ -z "$registry_route" ]]; then
+        log_info "Internal registry route not found. Exposing it..."
+        oc patch configs.imageregistry.operator.openshift.io/cluster \
+            --type merge -p '{"spec":{"defaultRoute":true}}' 2>/dev/null || true
+        sleep 5
+        registry_route=$(oc get route default-route -n openshift-image-registry \
+            -o jsonpath='{.spec.host}' 2>/dev/null || true)
+    fi
+
+    if [[ -z "$registry_route" ]]; then
+        log_error "Could not get internal registry route. Expose it manually:"
+        echo "  oc patch configs.imageregistry.operator.openshift.io/cluster --type merge -p '{\"spec\":{\"defaultRoute\":true}}'"
+        exit 1
+    fi
+
+    log_info "Internal registry: ${registry_route}"
+
+    # Login to the internal registry using the OC token
+    local oc_token
+    oc_token=$(oc whoami -t)
+    log_info "Logging into internal registry..."
+    podman login --tls-verify=false -u "$(oc whoami)" -p "${oc_token}" "${registry_route}"
+
+    # Tag and push to internal registry
+    INTERNAL_IMAGE_REF="${registry_route}/${NAMESPACE}/${APP_NAME}:${IMAGE_TAG}"
+    local svc_image_ref="image-registry.openshift-image-registry.svc:5000/${NAMESPACE}/${APP_NAME}:${IMAGE_TAG}"
+
+    log_info "Tagging: ${IMAGE_REF} → ${INTERNAL_IMAGE_REF}"
+    podman tag "${IMAGE_REF}" "${INTERNAL_IMAGE_REF}"
+
+    log_info "Pushing to internal registry..."
+    podman push --tls-verify=false "${INTERNAL_IMAGE_REF}"
+
+    log_success "Image mirrored to internal registry"
+    log_info "Internal ref: ${svc_image_ref}"
+
+    # Store the svc-internal ref for deploy to use
+    INTERNAL_IMAGE_REF="${svc_image_ref}"
 }
 
 # Deploy to OpenShift
@@ -250,6 +373,28 @@ deploy_openshift() {
     log_info "Applying deployment, service, and route..."
     oc apply -f openshift/deployment.yaml
 
+    # If mirroring, switch the deployment image to the internal registry
+    if [[ "$MIRROR_MODE" == true && -n "$INTERNAL_IMAGE_REF" ]]; then
+        log_info "Patching deployment to use internal image: ${INTERNAL_IMAGE_REF}"
+        oc set image deployment/${APP_NAME} -n ${NAMESPACE} \
+            checker="${INTERNAL_IMAGE_REF}"
+        log_success "Deployment image updated to internal registry"
+    fi
+
+    # Inject proxy env vars into the deployment if --proxy was provided
+    if [[ -n "$PROXY_URL" ]]; then
+        local no_proxy="${NO_PROXY_HOSTS:-$DEFAULT_NO_PROXY}"
+        log_info "Injecting proxy into deployment: ${PROXY_URL}"
+        oc set env deployment/${APP_NAME} -n ${NAMESPACE} \
+            HTTP_PROXY="${PROXY_URL}" \
+            HTTPS_PROXY="${PROXY_URL}" \
+            NO_PROXY="${no_proxy}" \
+            http_proxy="${PROXY_URL}" \
+            https_proxy="${PROXY_URL}" \
+            no_proxy="${no_proxy}"
+        log_success "Proxy environment variables injected"
+    fi
+
     log_success "All manifests applied successfully"
 
     # Show the route
@@ -258,10 +403,15 @@ deploy_openshift() {
     log_info "Application URL: https://${ROUTE_URL}"
 }
 
-# Full pipeline: build, push, deploy, restart
+# Full pipeline: build, push/mirror, deploy, restart
 build_push_deploy() {
+    local push_label="Push to Quay.io"
+    if [[ "$MIRROR_MODE" == true ]]; then
+        push_label="Mirror to internal registry"
+    fi
+
     log_info "═══════════════════════════════════════════════════════════════"
-    log_info "  Full Pipeline: Build → Push → Deploy → Restart"
+    log_info "  Full Pipeline: Build → ${push_label} → Deploy → Restart"
     log_info "═══════════════════════════════════════════════════════════════"
     echo ""
 
@@ -269,8 +419,13 @@ build_push_deploy() {
     build_image
     echo ""
 
-    log_info "Step 2/4: Pushing image..."
-    push_image
+    if [[ "$MIRROR_MODE" == true ]]; then
+        log_info "Step 2/4: Mirroring to internal registry..."
+        mirror_to_internal
+    else
+        log_info "Step 2/4: Pushing image..."
+        push_image
+    fi
     echo ""
 
     log_info "Step 3/4: Deploying to OpenShift..."
@@ -535,57 +690,82 @@ remove_openshift() {
 }
 
 # ============================================================================
-# Main Script
+# Main Script — parse global options, then run action
 # ============================================================================
 
-case "${1:-}" in
-    --build)
-        build_image
-        ;;
-    --run-local)
-        run_local
-        ;;
-    --stop)
-        stop_service
-        ;;
-    --status)
-        check_status
-        ;;
-    --logs)
-        show_logs
-        ;;
-    --destroy)
-        destroy_everything
-        ;;
-    --push)
-        push_image
-        ;;
-    --deploy)
-        deploy_openshift
-        ;;
-    --build-push-deploy)
-        build_push_deploy
-        ;;
-    --restart)
-        restart_deployment
-        ;;
-    --openshift-status)
-        openshift_status
-        ;;
-    --openshift-logs)
-        openshift_logs
-        ;;
-    --remove)
-        remove_openshift
-        ;;
-    --persistent)
-        persist_registries
-        ;;
-    --help|-h|"")
-        show_help
-        ;;
+ACTION=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --proxy)
+            if [[ -z "${2:-}" || "$2" == --* ]]; then
+                log_error "--proxy requires a URL or 'auto' (e.g. --proxy http://proxy:8080 or --proxy auto)"
+                exit 1
+            fi
+            if [[ "$2" == "auto" ]]; then
+                if ! detect_cluster_proxy; then
+                    log_error "Could not auto-detect proxy. Is 'oc' logged in? Does the cluster have a Proxy object?"
+                    exit 1
+                fi
+            else
+                PROXY_URL="$2"
+            fi
+            shift 2
+            ;;
+        --no-proxy)
+            if [[ -z "${2:-}" || "$2" == --* ]]; then
+                log_error "--no-proxy requires a host list (e.g. --no-proxy '.local,10.0.0.0/8')"
+                exit 1
+            fi
+            NO_PROXY_HOSTS="$2"
+            shift 2
+            ;;
+        --mirror)
+            MIRROR_MODE=true
+            shift
+            ;;
+        --help|-h)
+            ACTION="help"
+            shift
+            ;;
+        --*)
+            if [[ -n "$ACTION" ]]; then
+                log_error "Only one action allowed, got both '${ACTION}' and '$1'"
+                exit 1
+            fi
+            ACTION="$1"
+            shift
+            ;;
+        *)
+            log_error "Unknown option: $1"
+            echo "Run '$0 --help' for usage information."
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -n "$PROXY_URL" ]]; then
+    log_info "Proxy configured: ${PROXY_URL}"
+fi
+
+case "${ACTION:-help}" in
+    --build)            build_image ;;
+    --run-local)        run_local ;;
+    --stop)             stop_service ;;
+    --status)           check_status ;;
+    --logs)             show_logs ;;
+    --destroy)          destroy_everything ;;
+    --push)             push_image ;;
+    --mirror-push)      mirror_to_internal ;;
+    --deploy)           deploy_openshift ;;
+    --build-push-deploy) build_push_deploy ;;
+    --restart)          restart_deployment ;;
+    --openshift-status) openshift_status ;;
+    --openshift-logs)   openshift_logs ;;
+    --remove)           remove_openshift ;;
+    --persistent)       persist_registries ;;
+    help)               show_help ;;
     *)
-        log_error "Unknown option: $1"
+        log_error "Unknown action: ${ACTION}"
         echo "Run '$0 --help' for usage information."
         exit 1
         ;;
