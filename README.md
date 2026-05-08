@@ -17,15 +17,17 @@ This tool helps cluster administrators identify those images before the upgrade,
 
 ## Features
 
-- Two-level image analysis (name/tag rules + remote metadata inspection via skopeo)
-- Severity classification: CRITICAL, HIGH, MEDIUM, LOW, OK
+- Three-level image analysis (name/tag rules + remote metadata via skopeo + pod exec runtime detection)
+- Severity classification: CRITICAL, HIGH, MEDIUM, LOW, INFO, OK, UNKNOWN
+- Inspection metadata audit trail (shows what skopeo found for each image)
+- Insufficient metadata detection (flags images that lack labels/OS identification)
 - Clickable severity cards to filter the report table
 - Image drilldown modal showing pods and namespaces per image
 - Pagination for large image lists (20/50/100/All)
 - Text filter and severity filter buttons
 - Filter for images that failed skopeo inspection
 - CSV and JSON report download
-- Registry credentials management for private registries (in-memory only, not persisted)
+- Registry credentials management for private registries
 - Skip reason breakdown for excluded pods (system namespaces vs. user-excluded)
 - Background scan with real-time progress reporting
 - PatternFly 6 dark theme (OpenShift Console style)
@@ -48,6 +50,17 @@ Uses `skopeo inspect docker://IMAGE` to read remote metadata (manifest and confi
 - Environment variables (`JAVA_VERSION`, JVM flags)
 - References to cgroups v1 paths in CMD/Entrypoint
 - Direct cgroups v1 file references (`memory.limit_in_bytes`, etc.)
+- Red Hat middleware detection (JBoss EAP, Data Grid versions via labels)
+
+Images without base image labels or OS identification are flagged with "Insufficient Metadata" (LOW severity), recommending exec check or adding OCI labels. The JSON report includes an `inspection_metadata` block for each inspected image showing what skopeo found (label count, relevant labels, env vars), providing a clear audit trail for why an image was marked OK.
+
+### Level 3 -- Pod Exec Runtime Detection (optional)
+
+Executes a detection script inside running pods to check for cgroups v1 usage at runtime:
+
+- Whether the pod runs under cgroups v1 or v2 hierarchy
+- Application files that reference v1-specific paths
+- Environment variables referencing cgroups v1
 
 ### Severity Classification
 
@@ -56,8 +69,10 @@ Uses `skopeo inspect docker://IMAGE` to read remote metadata (manifest and confi
 | CRITICAL | Incompatible or EOL base image (RHEL 6/7, CentOS 7) |
 | HIGH | Runtime with serious cgroups v2 issues (Java < 11, Elasticsearch 6.x) |
 | MEDIUM | Possible issue, needs validation (Alpine < 3.14, .NET < 6) |
-| LOW | Low risk, update recommended |
-| OK | No issues detected |
+| LOW | Low risk or insufficient metadata for validation |
+| INFO | Informational finding |
+| OK | No issues detected (metadata validated) |
+| UNKNOWN | Not inspected (skopeo disabled or failed) |
 
 Images found only in initContainers have their severity downgraded by one level.
 
@@ -68,10 +83,11 @@ Browser  -->  Flask (Gunicorn, PatternFly v6 dark theme)
                 |
                 +--> Kubernetes API (list pods, read cluster info)
                 +--> skopeo inspect docker://IMAGE (metadata only)
+                +--> pod exec (optional runtime detection)
                 +--> JSON reports saved to REPORT_DIR
 ```
 
-The application runs inside the OpenShift cluster with a ServiceAccount that has permission to list pods, read secrets (ImagePullSecrets), and read cluster version info.
+The application runs inside the OpenShift cluster with a ServiceAccount that has permission to list pods, exec into pods, read secrets (ImagePullSecrets), and read cluster version info.
 
 ## File Structure
 
@@ -79,7 +95,7 @@ The application runs inside the OpenShift cluster with a ServiceAccount that has
 app/
   app.py             Flask application factory
   config.py          Configuration via environment variables
-  scanner.py         Scanning engine (Kubernetes API + skopeo)
+  scanner.py         Scanning engine (Kubernetes API + skopeo + exec)
   routes.py          Web routes (dashboard, reports, CSV download)
   api.py             REST API (/api/scan, /api/reports, /api/registries)
   templates/         Jinja2 templates (PatternFly v6 dark theme)
@@ -110,12 +126,12 @@ requirements.txt     Python dependencies
 Using the setup script:
 
 ```bash
-# Full pipeline: build, push, deploy, restart
+# Full pipeline: build, push to Quay.io, deploy, restart
 ./setup.sh --build-push-deploy
 
 # Individual steps
 ./setup.sh --build      # Build container image
-./setup.sh --push       # Push to registry
+./setup.sh --push       # Push to Quay.io
 ./setup.sh --deploy     # Apply OpenShift manifests
 ./setup.sh --restart    # Rollout restart
 
@@ -123,21 +139,70 @@ Using the setup script:
 ./setup.sh --remove
 ```
 
-Or manually:
+### Deploy Behind a Corporate Proxy
+
+When the cluster is behind a corporate proxy that intercepts TLS, image pulls from external registries may fail. Use `--mirror` to push the image directly to the OCP internal registry, bypassing the proxy entirely:
 
 ```bash
-# Build and push
-podman build -t quay.io/YOUR_USER/cgroups-v2-checker:latest -f Containerfile .
-podman push quay.io/YOUR_USER/cgroups-v2-checker:latest
+# Build locally and push to the internal registry (recommended for proxy environments)
+./setup.sh --mirror --build-push-deploy
 
-# Deploy
-oc apply -f openshift/namespace.yaml
-oc apply -f openshift/rbac.yaml
-oc apply -f openshift/deployment.yaml
+# Auto-detect proxy from cluster config and inject into the deployment (for skopeo)
+./setup.sh --mirror --proxy auto --build-push-deploy
 
-# Get the application URL
-oc get route -n cgroups-v2-checker
+# Use a specific proxy URL
+./setup.sh --mirror --proxy http://proxy.corp.com:8080 --build-push-deploy
 ```
+
+### setup.sh Reference
+
+```
+Usage: ./setup.sh [global options] <action>
+
+Global Options:
+  --proxy <URL|auto>       Set HTTP/HTTPS proxy (used in build, push,
+                           and injected into the OpenShift deployment).
+                           Use "auto" to read from cluster Proxy object.
+  --no-proxy <hosts>       Comma-separated NO_PROXY hosts (optional,
+                           auto-detected from cluster or uses defaults)
+  --mirror                 Push image to the OCP internal registry
+                           instead of Quay.io (avoids proxy/TLS issues)
+
+Actions:
+  Local Development:
+    --build                Build the container image
+    --run-local            Run locally with Podman
+    --stop                 Stop the local container
+    --status               Check local container status
+    --logs                 Show local container logs
+    --destroy              Remove container, image, and data
+
+  OpenShift Deployment:
+    --push                 Push image to Quay.io
+    --deploy               Deploy to OpenShift (apply manifests)
+    --build-push-deploy    Full pipeline: build, push, deploy, restart
+    --restart              Restart the OpenShift deployment
+    --persistent           Persist registry credentials to a K8s Secret
+    --openshift-status     Show OpenShift resources status
+    --openshift-logs       Tail OpenShift deployment logs
+    --remove               Completely remove app from OpenShift
+```
+
+**How `--mirror` works:**
+
+1. Exposes the OCP internal registry route (if not already exposed)
+2. Logs in using the current `oc` session token
+3. Tags and pushes the image to `image-registry.openshift-image-registry.svc:5000/<namespace>/<app>`
+4. Patches the Deployment to use the internal image reference
+
+**How `--proxy` works:**
+
+| Action | Effect |
+|---|---|
+| `--build` | Passes `http_proxy`/`https_proxy` as `--build-arg` to podman |
+| `--push` | Exports proxy env vars for podman push |
+| `--deploy` | Injects `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` into the Deployment via `oc set env` |
+| `auto` | Reads proxy config from `oc get proxy cluster` (httpProxy, httpsProxy, noProxy) |
 
 ### Local Development
 
@@ -160,6 +225,7 @@ Access `http://localhost:8080`. Uses the local kubeconfig (`~/.kube/config` or `
 | `SKOPEO_AUTH_FILE` | (empty) | Auth file path for private registries |
 | `SKOPEO_MAX_WORKERS` | `20` | Parallel threads for skopeo inspection |
 | `USE_IMAGE_PULL_SECRETS` | `true` | Extract registry auth from pods/ServiceAccounts |
+| `REGISTRIES_FILE` | (empty) | Path to mounted registries.json from K8s Secret |
 
 ## REST API
 
@@ -179,7 +245,7 @@ Access `http://localhost:8080`. Uses the local kubeconfig (`~/.kube/config` or `
 ```bash
 curl -X POST http://ROUTE_URL/api/scan \
   -H "Content-Type: application/json" \
-  -d '{"namespaces": ["my-app"], "inspect_images": true}'
+  -d '{"namespaces": ["my-app"], "inspect_images": true, "exec_check": true}'
 ```
 
 ### Scan options
@@ -188,7 +254,10 @@ curl -X POST http://ROUTE_URL/api/scan \
 |---|---|---|---|
 | `namespaces` | list | all | Specific namespaces to scan |
 | `exclude_namespaces` | list | none | Namespaces to exclude |
-| `inspect_images` | bool | true | Enable skopeo remote inspection |
+| `namespace_patterns` | list | none | Regex patterns to include namespaces |
+| `exclude_patterns` | list | none | Regex patterns to exclude namespaces |
+| `inspect_images` | bool | true | Enable skopeo remote inspection (Level 2) |
+| `exec_check` | bool | false | Enable pod exec runtime detection (Level 3) |
 
 ## Container Image
 

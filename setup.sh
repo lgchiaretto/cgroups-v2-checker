@@ -16,6 +16,8 @@
 #                            auto-detected from cluster or uses defaults)
 #   --mirror                 Push image to the OCP internal registry
 #                            instead of Quay.io (avoids proxy/TLS issues)
+#   --ca-cert <file>         Custom CA certificate PEM for TLS-
+#                            intercepting proxies. Injected into build.
 #
 # Actions:
 #   Local Development:
@@ -65,6 +67,9 @@ DEFAULT_NO_PROXY=".cluster.local,.svc,10.128.0.0/14,172.30.0.0/16,localhost,127.
 MIRROR_MODE=false
 INTERNAL_IMAGE_REF=""
 
+# Custom CA certificate for TLS-intercepting proxies
+CUSTOM_CA_PATH=""
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -90,7 +95,7 @@ log_error() {
 
 # Show help
 show_help() {
-    head -40 "$0" | tail -38
+    head -42 "$0" | tail -40
     exit 0
 }
 
@@ -138,7 +143,18 @@ build_image() {
         build_args+=(--build-arg "https_proxy=${PROXY_URL}")
         build_args+=(--build-arg "no_proxy=${NO_PROXY_HOSTS:-$DEFAULT_NO_PROXY}")
     fi
+    if [[ -n "$CUSTOM_CA_PATH" ]]; then
+        local ca_filename
+        ca_filename=$(basename "$CUSTOM_CA_PATH")
+        cp "$CUSTOM_CA_PATH" "${SCRIPT_DIR}/${ca_filename}"
+        build_args+=(--build-arg "CUSTOM_CA=${ca_filename}")
+        log_info "Custom CA certificate: ${ca_filename}"
+    fi
     podman build "${build_args[@]}" -t "${IMAGE_REF}" -f Containerfile .
+    # Clean up copied CA file
+    if [[ -n "$CUSTOM_CA_PATH" ]]; then
+        rm -f "${SCRIPT_DIR}/$(basename "$CUSTOM_CA_PATH")"
+    fi
     log_success "Image built successfully: ${IMAGE_REF}"
 }
 
@@ -722,6 +738,19 @@ while [[ $# -gt 0 ]]; do
         --mirror)
             MIRROR_MODE=true
             shift
+            ;;
+        --ca-cert)
+            if [[ -z "${2:-}" || "$2" == --* ]]; then
+                log_error "--ca-cert requires a file path (e.g. --ca-cert /path/to/proxy-ca.pem)"
+                exit 1
+            fi
+            if [[ ! -f "$2" ]]; then
+                log_error "CA certificate file not found: $2"
+                exit 1
+            fi
+            CUSTOM_CA_PATH="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
+            log_info "Custom CA certificate: ${CUSTOM_CA_PATH}"
+            shift 2
             ;;
         --help|-h)
             ACTION="help"
