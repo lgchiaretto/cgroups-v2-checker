@@ -343,21 +343,17 @@ class CGroupsV2Scanner:
             logger.info("Using local kubeconfig.")
 
         # Kubernetes client >= 28 falls back to HTTPS_PROXY env var when
-        # Configuration.proxy is None. Force direct connection to prevent
-        # multi-minute timeouts when the proxy can't reach the API server.
+        # Configuration.proxy is None. urllib3 may also read proxy env vars
+        # at request time (not just at client creation). Setting proxy to ""
+        # explicitly disables proxy at the Configuration level, which is
+        # authoritative regardless of env vars.
+        cfg = client.Configuration.get_default_copy()
+        cfg.proxy = ""
         proxy_env = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or \
                     os.environ.get("https_proxy") or os.environ.get("http_proxy")
         if proxy_env:
-            logger.info("HTTP(S)_PROXY detected; forcing direct connection to K8s API.")
-            saved = {}
-            for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-                if var in os.environ:
-                    saved[var] = os.environ.pop(var)
-            api_client = client.ApiClient()
-            for var, val in saved.items():
-                os.environ[var] = val
-        else:
-            api_client = client.ApiClient()
+            logger.info("HTTP(S)_PROXY detected; forcing direct connection to K8s API (proxy disabled in Configuration).")
+        api_client = client.ApiClient(configuration=cfg)
 
         self._api_client = api_client
         self.v1 = client.CoreV1Api(api_client)
