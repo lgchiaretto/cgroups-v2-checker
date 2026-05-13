@@ -297,6 +297,9 @@ class CGroupsV2Scanner:
         # Map image -> (namespace, pod_name, container_name) for exec checks
         self._image_pod_map: Dict[str, Tuple[str, str, str]] = {}
         self._api_client: Optional[client.ApiClient] = None
+        # Images where JAVA_VERSION env var lacks the update suffix (e.g. "1.8.0")
+        # and need a targeted `java -version` exec to resolve the real version
+        self._java_version_unresolved: Set[str] = set()
 
     @staticmethod
     def _compile_patterns(patterns: Optional[List[str]]) -> List[re.Pattern]:
@@ -692,6 +695,12 @@ class CGroupsV2Scanner:
         if self.inspect_images and self._check_skopeo():
             self._skopeo_inspect_all()
 
+        # Resolve ambiguous Java versions (e.g. JAVA_VERSION=1.8.0 without
+        # update suffix) by running `java -version` inside pods.
+        # Runs automatically regardless of exec_check flag.
+        if self._java_version_unresolved:
+            self._verify_java_versions()
+
         # Level 3: pod exec cgroups v1 runtime detection
         if self.exec_check:
             self._exec_check_all()
@@ -724,12 +733,30 @@ class CGroupsV2Scanner:
                     f"Image: {report.image}"))
 
     def _check_runtime_versions(self, report: ImageReport, img: str):
-        # Java
-        m = re.search(
-            r"(?:openjdk|jdk|java|eclipse-temurin|amazoncorretto|liberica|zulu)"
-            r"[:\-_]?(\d+)(?:[.\-_](\d+))?(?:[.\-_](\d+))?", img)
-        if m:
-            major, minor, patch = int(m.group(1)), int(m.group(2) or 0), int(m.group(3) or 0)
+        # Java — check both new-style (jdk-17, openjdk:11) and old-style (openjdk:1.8.0_412)
+        java_prefix = r"(?:openjdk|jdk|java|eclipse-temurin|amazoncorretto|liberica|zulu)"
+        # Old-style tag: openjdk:1.8.0_412 or openjdk:1.8.0
+        m_old = re.search(java_prefix + r"[:\-_]1\.(\d+)\.0(?:[_\-](\d+))?", img)
+        # New-style tag: openjdk:17, jdk-11.0.16
+        m_new = re.search(java_prefix + r"[:\-_]?(\d+)(?:[.\-_](\d+))?(?:[.\-_](\d+))?", img)
+
+        if m_old:
+            major = int(m_old.group(1))
+            update = int(m_old.group(2)) if m_old.group(2) else -1
+            if major == 8 and update < 0:
+                self._java_version_unresolved.add(report.image)
+            else:
+                safe = (major >= 15 or
+                        (major == 11 and update >= 16) or
+                        (major == 8 and update >= 372))
+                if not safe:
+                    sev = "HIGH" if major < 11 else "MEDIUM"
+                    report.findings.append(Finding("Java Runtime", sev,
+                        f"Java {major} detected — may not recognize cgroups v2 limits",
+                        f"{JAVA_DETAIL} Safe versions: {JAVA_SAFE_VERSIONS}",
+                        f"Tag version: {m_old.group(0)}"))
+        elif m_new:
+            major, minor, patch = int(m_new.group(1)), int(m_new.group(2) or 0), int(m_new.group(3) or 0)
             safe = (major >= 15 or
                     (major == 11 and (minor > 0 or patch >= 16)) or
                     (major == 8 and patch >= 372))
@@ -738,7 +765,7 @@ class CGroupsV2Scanner:
                 report.findings.append(Finding("Java Runtime", sev,
                     f"Java {major} detected — may not recognize cgroups v2 limits",
                     f"{JAVA_DETAIL} Safe versions: {JAVA_SAFE_VERSIONS}",
-                    f"Tag version: {m.group(0)}"))
+                    f"Tag version: {m_new.group(0)}"))
 
         # .NET — .NET 5+ is fully cgroups v2 compatible (since 2020)
         m = re.search(r"(?:dotnet|aspnet|dotnet-runtime)[:\-/](\d+)\.(\d+)", img)
@@ -1057,27 +1084,50 @@ class CGroupsV2Scanner:
 
     def _check_java_env(self, report: ImageReport, ver_str: str):
         ver = ver_str.strip()
-        m_old = re.match(r"1\.(\d+)\.0[_\-](\d+)", ver)
+
+        # Old-style with update: 1.8.0_412, 1.7.0_80
+        m_old_full = re.match(r"1\.(\d+)\.0[_\-](\d+)", ver)
+        # Old-style without update: 1.8.0 (common in Red Hat base images)
+        m_old_short = re.match(r"1\.(\d+)\.0$", ver)
+        # New-style: 11.0.16, 17, 21.0.1
         m_new = re.match(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", ver)
+
         major = minor = patch = 0
-        if m_old:
-            major, patch = int(m_old.group(1)), int(m_old.group(2))
+        has_update = True
+
+        if m_old_full:
+            major, patch = int(m_old_full.group(1)), int(m_old_full.group(2))
+        elif m_old_short:
+            # "1.8.0" → Java 8, but update version unknown
+            major = int(m_old_short.group(1))
+            has_update = False
         elif m_new:
             major = int(m_new.group(1))
             minor = int(m_new.group(2) or 0)
             patch = int(m_new.group(3) or 0)
+
         if major == 0:
             return
+
         safe = (major >= 15 or
                 (major == 11 and (minor > 0 or patch >= 16)) or
                 (major == 8 and patch >= 372))
-        if not safe:
-            if not any(f.category == "Java Runtime (skopeo)" for f in report.findings):
-                sev = "HIGH" if major < 11 else "MEDIUM"
-                report.findings.append(Finding("Java Runtime (skopeo)", sev,
-                    f"Java {ver} via JAVA_VERSION ENV — may not support cgroups v2",
-                    f"Safe versions: {JAVA_SAFE_VERSIONS}",
-                    f"ENV JAVA_VERSION={ver}"))
+
+        if safe:
+            return
+
+        if not any(f.category == "Java Runtime (skopeo)" for f in report.findings):
+            # Java 8 without update version (e.g. JAVA_VERSION=1.8.0):
+            # Red Hat OpenJDK 8u372+ has cgroups v2 support backported.
+            # Flag for targeted `java -version` exec to resolve the real version.
+            if major == 8 and not has_update:
+                self._java_version_unresolved.add(report.image)
+                return
+            sev = "HIGH" if major < 11 else "MEDIUM"
+            report.findings.append(Finding("Java Runtime (skopeo)", sev,
+                f"Java {ver} via JAVA_VERSION ENV — may not support cgroups v2",
+                f"Safe versions: {JAVA_SAFE_VERSIONS}",
+                f"ENV JAVA_VERSION={ver}"))
 
     def _check_middleware_labels(self, report: ImageReport, labels: dict):
         """Detect Red Hat middleware products via OCI/Red Hat labels.
@@ -1127,6 +1177,129 @@ class CGroupsV2Scanner:
                         "(upstream default). Upgrade to 8.4.6+ for 50% heap, or set "
                         "MaxRAMPercentage explicitly.",
                         f"Label: com.redhat.component={rh_comp}"))
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Java version verification via pod exec
+    # ─────────────────────────────────────────────────────────────────────
+    def _verify_java_versions(self):
+        """Run `java -version` inside pods to resolve ambiguous Java versions.
+
+        When JAVA_VERSION env var lacks the update suffix (e.g. "1.8.0" instead
+        of "1.8.0_412"), we can't determine cgroups v2 compatibility from metadata
+        alone. This method execs into running pods to get the real version.
+
+        Runs automatically (independent of --exec-check flag) because the
+        alternative is a false positive.
+        """
+        targets = {
+            img: self._image_pod_map[img]
+            for img in self._java_version_unresolved
+            if img in self._image_pod_map
+        }
+
+        if not targets:
+            # No running pods available for verification — add fallback findings
+            for img in self._java_version_unresolved:
+                if img in self.image_reports:
+                    report = self.image_reports[img]
+                    if not any(f.category.startswith("Java Runtime") for f in report.findings):
+                        report.findings.append(Finding("Java Runtime (skopeo)", "MEDIUM",
+                            "Java 8 detected (JAVA_VERSION env) — could not verify update version",
+                            f"No running pod available to exec 'java -version'. "
+                            f"Safe versions: {JAVA_SAFE_VERSIONS}",
+                            "JAVA_VERSION lacks update suffix and pod exec was not possible"))
+            return
+
+        total = len(targets)
+        logger.info(f"Java version verification: {total} images to check via pod exec")
+
+        with ThreadPoolExecutor(max_workers=min(total, _EXEC_MAX_WORKERS)) as executor:
+            futures = {
+                executor.submit(self._verify_java_version_one, img, ns, pod, container): img
+                for img, (ns, pod, container) in targets.items()
+            }
+            done = 0
+            for future in as_completed(futures):
+                done += 1
+                img = futures[future]
+                self._report_progress("java_verify", done, total,
+                    f"Verifying Java ({done}/{total}): {img[:60]}")
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.debug(f"Java version check failed for {img}: {e}")
+
+        # Fallback for images where exec failed (no output)
+        for img in self._java_version_unresolved:
+            if img in self.image_reports:
+                report = self.image_reports[img]
+                if not any(f.category.startswith("Java Runtime") for f in report.findings):
+                    report.findings.append(Finding("Java Runtime (skopeo)", "MEDIUM",
+                        "Java 8 detected (JAVA_VERSION env) — could not verify update version",
+                        f"Pod exec for 'java -version' failed. Manually verify: "
+                        f"Safe versions: {JAVA_SAFE_VERSIONS}",
+                        "JAVA_VERSION lacks update suffix and java -version exec failed"))
+
+    def _verify_java_version_one(self, image: str, namespace: str, pod_name: str, container: str):
+        """Exec `java -version` inside a pod and resolve the finding."""
+        report = self.image_reports[image]
+
+        try:
+            output = k8s_stream(
+                self.v1.connect_get_namespaced_pod_exec,
+                pod_name, namespace,
+                container=container,
+                command=["/bin/sh", "-c", "java -version 2>&1"],
+                stderr=True, stdin=False, stdout=True, tty=False,
+                _request_timeout=_EXEC_TIMEOUT,
+            )
+        except Exception as e:
+            logger.debug(f"Java version exec failed for {namespace}/{pod_name}: {e}")
+            return
+
+        if not output:
+            return
+
+        # Parse: openjdk version "1.8.0_412" or java version "17.0.2"
+        m = re.search(r'version "([^"]+)"', output)
+        if not m:
+            logger.debug(f"Could not parse java -version output for {image}: {output[:200]}")
+            return
+
+        real_version = m.group(1)
+        logger.info(f"Java version verified for {image}: {real_version}")
+
+        # Parse the real version to determine safety
+        m_old = re.match(r"1\.(\d+)\.0[_\-](\d+)", real_version)
+        m_new = re.match(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", real_version)
+        major = minor = patch = 0
+        if m_old:
+            major, patch = int(m_old.group(1)), int(m_old.group(2))
+        elif m_new:
+            major = int(m_new.group(1))
+            minor = int(m_new.group(2) or 0)
+            patch = int(m_new.group(3) or 0)
+
+        if major == 0:
+            return
+
+        safe = (major >= 15 or
+                (major == 11 and (minor > 0 or patch >= 16)) or
+                (major == 8 and patch >= 372))
+
+        # Remove from unresolved set — we have a definitive answer
+        self._java_version_unresolved.discard(image)
+
+        if safe:
+            report.inspection_metadata["java_version_verified"] = real_version
+            report.inspection_metadata["java_cgroups_v2_safe"] = True
+            logger.info(f"Java {real_version} is cgroups v2 safe for {image}")
+        else:
+            sev = "HIGH" if major < 11 else "MEDIUM"
+            report.findings.append(Finding("Java Runtime (verified)", sev,
+                f"Java {real_version} confirmed via pod exec — does not support cgroups v2",
+                f"Safe versions: {JAVA_SAFE_VERSIONS}",
+                f"Verified via 'java -version' in pod {namespace}/{pod_name}"))
 
     # ─────────────────────────────────────────────────────────────────────
     # Level 3: pod exec cgroups v1 runtime detection

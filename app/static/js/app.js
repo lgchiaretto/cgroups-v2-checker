@@ -162,6 +162,7 @@ document.addEventListener("DOMContentLoaded", function () {
       collecting: "Collecting pod images...",
       analyzing: "Analyzing images (name/tag)...",
       skopeo: "Remote inspection via skopeo...",
+      java_verify: "Verifying Java versions via pod exec...",
       exec_check: "Runtime check via pod exec...",
       saving: "Saving report...",
       done: "Scan complete!",
