@@ -1005,14 +1005,7 @@ class CGroupsV2Scanner:
                     self._check_java_env(report, jm.group(1))
 
         if not report.findings and not metadata.get("has_base_image_label") and not metadata.get("has_os_labels"):
-            report.findings.append(Finding(
-                "Insufficient Metadata (skopeo)", "LOW",
-                "Image has no base image labels or OS identification — cannot validate via metadata alone",
-                "Add OCI labels (org.opencontainers.image.base.name, com.redhat.component) to the image, "
-                "or run scan with exec_check enabled to verify at runtime.",
-                f"Labels found: {metadata.get('label_count', 0)}, "
-                f"ENV vars: {metadata.get('env_count', 0)}",
-            ))
+            report.inspection_metadata["insufficient_labels"] = True
 
     @staticmethod
     def _build_inspection_metadata(labels: dict, env_list: list,
@@ -1181,26 +1174,6 @@ class CGroupsV2Scanner:
                              for f in self.image_reports[img].findings))
         self.cluster_info["exec_checked"] = str(total)
         logger.info(f"Exec check: completed {total} pods, {exec_ok} with findings")
-
-        # Remove "Insufficient Metadata" findings for images where exec ran
-        # successfully and found no cgroups v1 issues (runtime confirmed OK).
-        cleared = 0
-        for img in exec_targets:
-            report = self.image_reports[img]
-            if not report.exec_checked:
-                continue
-            has_runtime_finding = any(
-                f.category.startswith("Runtime Check") for f in report.findings)
-            if not has_runtime_finding:
-                before = len(report.findings)
-                report.findings = [
-                    f for f in report.findings
-                    if f.category != "Insufficient Metadata (skopeo)"
-                ]
-                if len(report.findings) < before:
-                    cleared += 1
-        if cleared:
-            logger.info(f"Exec check: cleared {cleared} 'Insufficient Metadata' findings (runtime confirmed OK)")
 
     def _exec_check_one(self, image: str, namespace: str, pod_name: str, container: str):
         """Execute the cgroups v1 check script inside a single pod container."""
