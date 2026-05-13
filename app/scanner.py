@@ -167,6 +167,7 @@ class ImageReport:
     findings: List[Finding] = field(default_factory=list)
     inspected: bool = False
     inspection_error: str = ""
+    exec_checked: bool = False
     only_in_init: bool = False
     inspection_metadata: Dict = field(default_factory=dict)
 
@@ -174,7 +175,7 @@ class ImageReport:
     def max_severity(self) -> str:
         order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
         if not self.findings:
-            if not self.inspected:
+            if not self.inspected and not self.exec_checked:
                 return "UNKNOWN"
             return "OK"
         return min(self.findings, key=lambda f: order.get(f.severity, 99)).severity
@@ -196,6 +197,7 @@ class ImageReport:
             "pod_count": len(self.pods),
             "inspected": self.inspected,
             "inspection_error": self.inspection_error,
+            "exec_checked": self.exec_checked,
             "findings": [f.to_dict() for f in self.findings],
         }
         if self.inspection_metadata:
@@ -1006,8 +1008,8 @@ class CGroupsV2Scanner:
             report.findings.append(Finding(
                 "Insufficient Metadata (skopeo)", "LOW",
                 "Image has no base image labels or OS identification — cannot validate via metadata alone",
-                "Run scan with exec_check enabled, or add OCI labels "
-                "(org.opencontainers.image.base.name, com.redhat.component) to the image.",
+                "Add OCI labels (org.opencontainers.image.base.name, com.redhat.component) to the image, "
+                "or run scan with exec_check enabled to verify at runtime.",
                 f"Labels found: {metadata.get('label_count', 0)}, "
                 f"ENV vars: {metadata.get('env_count', 0)}",
             ))
@@ -1180,6 +1182,26 @@ class CGroupsV2Scanner:
         self.cluster_info["exec_checked"] = str(total)
         logger.info(f"Exec check: completed {total} pods, {exec_ok} with findings")
 
+        # Remove "Insufficient Metadata" findings for images where exec ran
+        # successfully and found no cgroups v1 issues (runtime confirmed OK).
+        cleared = 0
+        for img in exec_targets:
+            report = self.image_reports[img]
+            if not report.exec_checked:
+                continue
+            has_runtime_finding = any(
+                f.category.startswith("Runtime Check") for f in report.findings)
+            if not has_runtime_finding:
+                before = len(report.findings)
+                report.findings = [
+                    f for f in report.findings
+                    if f.category != "Insufficient Metadata (skopeo)"
+                ]
+                if len(report.findings) < before:
+                    cleared += 1
+        if cleared:
+            logger.info(f"Exec check: cleared {cleared} 'Insufficient Metadata' findings (runtime confirmed OK)")
+
     def _exec_check_one(self, image: str, namespace: str, pod_name: str, container: str):
         """Execute the cgroups v1 check script inside a single pod container."""
         report = self.image_reports[image]
@@ -1207,6 +1229,7 @@ class CGroupsV2Scanner:
             logger.debug(f"Exec incomplete output for {namespace}/{pod_name}/{container}")
             return
 
+        report.exec_checked = True
         self._parse_exec_output(report, output, namespace, pod_name, container)
 
     def _parse_exec_output(self, report: ImageReport, output: str,

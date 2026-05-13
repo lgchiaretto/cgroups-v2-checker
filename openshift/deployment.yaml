@@ -29,7 +29,7 @@ spec:
             - name: SKIP_SYSTEM_NAMESPACES
               value: "true"
             - name: SKOPEO_TLS_VERIFY
-              value: "true"
+              value: "false"
             - name: SKOPEO_MAX_WORKERS
               value: "10"
           volumeMounts:

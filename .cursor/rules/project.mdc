@@ -35,12 +35,42 @@ OpenShift cgroups v2 scanner — Flask web app that scans clusters for container
 
 ## Build & Deploy
 
+There are **2 deployment modes**:
+
+### Mode 1: Quay.io (default — development/personal clusters)
+
+Image is pushed to `quay.io/chiaretto/cgroups-v2-checker`. Use when the cluster has direct internet access and can pull from Quay.io without proxy/TLS issues.
+
 ```bash
-./setup.sh --build-push-deploy                    # Full pipeline (Quay.io)
-./setup.sh --mirror --build-push-deploy           # Full pipeline (internal registry)
-./setup.sh --mirror --proxy auto --build-push-deploy  # Mirror + proxy for skopeo
-./setup.sh --restart                              # Rollout restart
+./setup.sh --build-push-deploy    # Build + push to Quay.io + deploy + restart
+./setup.sh --restart              # Rollout restart only
 ```
+
+### Mode 2: Enterprise / Internal Registry (corporate clusters behind proxy)
+
+Image is pushed to the OCP internal registry via `--mirror`. Used in corporate environments with HTTP proxy and private registries (e.g. `quay.intraservice.corp`).
+
+**First-time setup (configure proxy + persist registry creds):**
+```bash
+./setup.sh --proxy auto --ca-cert /etc/pki/tls/certs/ca-bundle.crt --persistent --deploy
+```
+
+**Subsequent deploys (build + push to internal registry):**
+```bash
+./setup.sh --proxy auto --mirror --build-push-deploy
+```
+
+**What each flag does:**
+- `--proxy auto` — Reads HTTP_PROXY/NO_PROXY from `oc get proxy cluster` and injects into the deployment
+- `--ca-cert <file>` — Injects CA certificate into the container image (for proxy TLS interception during build)
+- `--mirror` — Pushes image to OCP internal registry instead of Quay.io
+- `--persistent` — Persists registry credentials (for enterprise registries) as a K8s Secret so they survive pod restarts
+
+### Important: Enterprise environment behavior
+
+- **Proxy & K8s API**: The Python `kubernetes` client explicitly disables proxy (`Configuration.proxy = ""`) to connect directly to the API server. The proxy env vars are only used by skopeo for registry access.
+- **skopeo TLS verification**: Set to `SKOPEO_TLS_VERIFY=false` in the deployment manifest. Enterprise registries (e.g. `quay.intraservice.corp`) use internal CA certificates. Rather than injecting every CA into the container, skopeo skips TLS verification. Auth is still enforced via ImagePullSecrets.
+- **Image signature policy**: Some enterprise clusters enforce `ClusterImagePolicy` that rejects unsigned images from the internal registry. If `--mirror` fails with `SignatureValidationFailed`, the cluster admin must add an exception or use Quay.io mode instead.
 
 ## Key Patterns
 
@@ -50,7 +80,5 @@ OpenShift cgroups v2 scanner — Flask web app that scans clusters for container
 - initContainer-only images get severity downgraded one level
 - Images without base image labels flagged as "Insufficient Metadata" (LOW)
 - `inspection_metadata` in report JSON shows what skopeo found (audit trail)
-- `--mirror` pushes to OCP internal registry (bypasses proxy/TLS)
-- `--proxy auto` reads proxy from `oc get proxy cluster`
 - `--deploy` auto-seeds registry creds from cluster pull-secret on first deploy
 - Test locally: `python run.py` on port 8080
