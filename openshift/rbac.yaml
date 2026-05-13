@@ -18,10 +18,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "namespaces", "nodes"]
     verbs: ["get", "list"]
-  # Exec into pods for runtime cgroups v1 detection (Level 3)
+  # Exec into pods for Java version verification and runtime cgroups v1 detection
   - apiGroups: [""]
     resources: ["pods/exec"]
-    verbs: ["create"]
+    verbs: ["create", "get"]
   # Read ImagePullSecrets and ServiceAccounts for registry auth
   - apiGroups: [""]
     resources: ["secrets", "serviceaccounts"]
