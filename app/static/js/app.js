@@ -161,9 +161,9 @@ document.addEventListener("DOMContentLoaded", function () {
       connecting: "Connecting to cluster...",
       collecting: "Collecting pod images...",
       analyzing: "Analyzing images (name/tag)...",
-      skopeo: "Remote inspection via skopeo...",
-      java_verify: "Verifying Java versions via pod exec...",
-      exec_check: "Runtime check via pod exec...",
+      skopeo: "Remote inspection via skopeo and oc exec...",
+      java_verify: "Verifying Java versions via oc exec...",
+      exec_check: "Runtime cgroups check via oc exec...",
       saving: "Saving report...",
       done: "Scan complete!",
     };

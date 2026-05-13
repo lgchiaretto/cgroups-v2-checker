@@ -1211,7 +1211,11 @@ class CGroupsV2Scanner:
             return
 
         total = len(targets)
-        logger.info(f"Java version verification: {total} images to check via pod exec")
+        # Track exec errors per image for detailed fallback messages
+        exec_errors: Dict[str, str] = {}
+        not_in_pod_map = self._java_version_unresolved - targets.keys()
+        logger.info(f"Java version verification: {total} images to check via pod exec"
+                     f" ({len(not_in_pod_map)} without running pods)")
 
         with ThreadPoolExecutor(max_workers=min(total, _EXEC_MAX_WORKERS)) as executor:
             futures = {
@@ -1225,24 +1229,47 @@ class CGroupsV2Scanner:
                 self._report_progress("java_verify", done, total,
                     f"Verifying Java ({done}/{total}): {img[:60]}")
                 try:
-                    future.result()
+                    err = future.result()
+                    if err:
+                        exec_errors[img] = err
                 except Exception as e:
-                    logger.debug(f"Java version check failed for {img}: {e}")
+                    exec_errors[img] = str(e)
 
-        # Fallback for images where exec failed (no output)
-        for img in self._java_version_unresolved:
-            if img in self.image_reports:
-                report = self.image_reports[img]
-                if not any(f.category.startswith("Java Runtime") for f in report.findings):
-                    report.findings.append(Finding("Java Runtime (skopeo)", "MEDIUM",
-                        "Java 8 detected (JAVA_VERSION env) — could not verify update version",
-                        f"Pod exec for 'java -version' failed. Manually verify: "
-                        f"Safe versions: {JAVA_SAFE_VERSIONS}",
-                        "JAVA_VERSION lacks update suffix and java -version exec failed"))
+        resolved = total - len(self._java_version_unresolved & targets.keys())
+        failed = len(self._java_version_unresolved & targets.keys())
+        logger.info(f"Java version verification: {resolved} resolved, {failed} failed")
+        if exec_errors:
+            first_err = next(iter(exec_errors.values()))
+            logger.warning(f"Java version exec errors ({len(exec_errors)} images): {first_err}")
 
-    def _verify_java_version_one(self, image: str, namespace: str, pod_name: str, container: str):
-        """Exec `java -version` inside a pod and resolve the finding."""
+        # Fallback for images where exec failed or no pod available
+        for img in list(self._java_version_unresolved):
+            if img not in self.image_reports:
+                continue
+            report = self.image_reports[img]
+            if any(f.category.startswith("Java Runtime") for f in report.findings):
+                continue
+
+            if img in not_in_pod_map:
+                reason = "no running pod available for exec"
+            elif img in exec_errors:
+                reason = f"exec error: {exec_errors[img]}"
+            else:
+                reason = "java -version returned no parseable output"
+
+            report.findings.append(Finding("Java Runtime (skopeo)", "MEDIUM",
+                "Java 8 detected (JAVA_VERSION env) — could not verify update version",
+                f"Safe versions: {JAVA_SAFE_VERSIONS}",
+                f"JAVA_VERSION lacks update suffix. Exec verification failed: {reason}"))
+
+    def _verify_java_version_one(self, image: str, namespace: str,
+                                pod_name: str, container: str) -> Optional[str]:
+        """Exec `java -version` inside a pod and resolve the finding.
+
+        Returns None on success, or an error string on failure.
+        """
         report = self.image_reports[image]
+        pod_ref = f"{namespace}/{pod_name}:{container}"
 
         try:
             output = k8s_stream(
@@ -1253,21 +1280,26 @@ class CGroupsV2Scanner:
                 stderr=True, stdin=False, stdout=True, tty=False,
                 _request_timeout=_EXEC_TIMEOUT,
             )
+        except ApiException as e:
+            reason = f"HTTP {e.status}: {e.reason}" if hasattr(e, 'status') else str(e)
+            logger.warning(f"Java version exec rejected for {pod_ref}: {reason}")
+            return reason
         except Exception as e:
-            logger.debug(f"Java version exec failed for {namespace}/{pod_name}: {e}")
-            return
+            logger.warning(f"Java version exec failed for {pod_ref}: {e}")
+            return str(e)
 
         if not output:
-            return
+            logger.warning(f"Java version exec returned empty output for {pod_ref}")
+            return "exec returned empty output"
 
         # Parse: openjdk version "1.8.0_412" or java version "17.0.2"
         m = re.search(r'version "([^"]+)"', output)
         if not m:
-            logger.debug(f"Could not parse java -version output for {image}: {output[:200]}")
-            return
+            logger.warning(f"Could not parse java -version for {pod_ref}: {output[:200]}")
+            return f"unparseable output: {output[:100]}"
 
         real_version = m.group(1)
-        logger.info(f"Java version verified for {image}: {real_version}")
+        logger.info(f"Java version verified for {image}: {real_version} (pod {pod_ref})")
 
         # Parse the real version to determine safety
         m_old = re.match(r"1\.(\d+)\.0[_\-](\d+)", real_version)
@@ -1281,7 +1313,7 @@ class CGroupsV2Scanner:
             patch = int(m_new.group(3) or 0)
 
         if major == 0:
-            return
+            return f"could not parse version number from: {real_version}"
 
         safe = (major >= 15 or
                 (major == 11 and (minor > 0 or patch >= 16)) or
@@ -1299,7 +1331,9 @@ class CGroupsV2Scanner:
             report.findings.append(Finding("Java Runtime (verified)", sev,
                 f"Java {real_version} confirmed via pod exec — does not support cgroups v2",
                 f"Safe versions: {JAVA_SAFE_VERSIONS}",
-                f"Verified via 'java -version' in pod {namespace}/{pod_name}"))
+                f"Verified via 'java -version' in pod {pod_ref}"))
+
+        return None
 
     # ─────────────────────────────────────────────────────────────────────
     # Level 3: pod exec cgroups v1 runtime detection
