@@ -93,7 +93,7 @@
         label: "{{ lab_prefix }}-{{ item.0.name }}/{{ item.1.name }}"
       when: item.1.type is defined
 
-    - name: Wait for deployments
+    - name: Wait for deployments (best-effort, some images may fail to pull)
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig_path }}"
         api_version: apps/v1
@@ -104,11 +104,12 @@
       until:
         - deploy_status.resources | length > 0
         - deploy_status.resources[0].status.availableReplicas | default(0) >= (item.1.replicas | default(1))
-      retries: 60
+      retries: 24
       delay: 5
       loop: "{{ namespaces | subelements('deployments') }}"
       loop_control:
         label: "{{ lab_prefix }}-{{ item.0.name }}/{{ item.1.name }}"
+      ignore_errors: true
 
     - name: Count total pods
       ansible.builtin.set_fact:
