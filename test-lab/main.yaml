@@ -142,9 +142,9 @@
         body:
           items:
             - title: "cgroups v2 Checker — Test Lab"
-              url: ""
-              username: ""
-              password: ""
+              url: "n/a"
+              username: "n/a"
+              password: "n/a"
               description: "{{ total_pods }} test pods across {{ namespaces | length }} namespaces ({{ lab_prefix }}-*)"
         status_code:
           - 200
