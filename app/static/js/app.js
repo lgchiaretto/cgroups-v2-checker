@@ -52,10 +52,8 @@ document.addEventListener("DOMContentLoaded", function () {
   function startScan() {
     var include = _splitField("opt-include");
     var exclude = _splitField("opt-exclude");
-    var inspectImages = document.getElementById("opt-inspect").checked;
-    var execCheck = document.getElementById("opt-exec-check").checked;
 
-    var body = { inspect_images: inspectImages, exec_check: execCheck };
+    var body = {};
     if (include.names.length) body.namespaces = include.names;
     if (include.patterns.length) body.namespace_patterns = include.patterns;
     if (exclude.names.length) body.exclude_namespaces = exclude.names;
@@ -160,10 +158,7 @@ document.addEventListener("DOMContentLoaded", function () {
       initializing: "Initializing...",
       connecting: "Connecting to cluster...",
       collecting: "Collecting pod images...",
-      analyzing: "Analyzing images (name/tag)...",
-      skopeo: "Remote inspection via skopeo and oc exec...",
-      java_verify: "Verifying Java versions via oc exec...",
-      exec_check: "Runtime cgroups check via oc exec...",
+      inspecting: "Inspecting pods (OS, runtimes, cgroups)...",
       saving: "Saving report...",
       done: "Scan complete!",
     };

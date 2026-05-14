@@ -383,6 +383,9 @@ tags
 # Virtualenv
 # http://iamzed.com/2009/05/07/a-primer-on-virtualenv/
 
+# Scan reports (may contain cluster/client data)
+data/reports/*.json
+
 # Build artifacts
 .build-ca.pem
 

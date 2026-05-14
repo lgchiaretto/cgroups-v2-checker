@@ -7,7 +7,7 @@
   <div>
     <h1 class="pf-v6-c-title pf-m-2xl">Registry Credentials</h1>
     <p class="pf-v6-u-color-200 pf-v6-u-mt-sm">
-      Configure credentials for private container registries. These are used by skopeo during image inspection.
+      Configure credentials for private container registries. These are used by skopeo when fallback inspection is enabled.
     </p>
   </div>
 </div>
@@ -74,9 +74,9 @@
   <div class="pf-v6-c-alert__icon"><i class="fas fa-info-circle"></i></div>
   <h4 class="pf-v6-c-alert__title">How credentials are used</h4>
   <div class="pf-v6-c-alert__description">
-    <p>During a scan, skopeo uses these credentials to authenticate when inspecting images from private registries.
+    <p>When skopeo fallback is enabled, these credentials are used to authenticate when inspecting images from private registries.
        Credentials from <strong>ImagePullSecrets</strong> (extracted from pods) are also used automatically alongside these.
-       The most common registries that require login are <code>quay.io</code> and <code>registry.redhat.io</code>.</p>
+       The primary inspection method (pod exec) does not require registry credentials.</p>
     <p class="pf-v6-u-mt-sm pf-v6-u-color-200"><i class="fas fa-info-circle pf-v6-u-mr-xs"></i> <strong>Tip:</strong> Add your credentials before starting a scan. They only need to last for the duration of the scan.</p>
   </div>
 </div>

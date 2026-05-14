@@ -1,0 +1,39 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: "{{ deploy.name }}"
+  namespace: "{{ ns_name }}"
+  labels:
+    app: "{{ deploy.name }}"
+    lab: "{{ lab_prefix }}"
+spec:
+  replicas: {{ deploy.replicas | default(1) }}
+  selector:
+    matchLabels:
+      app: "{{ deploy.name }}"
+  template:
+    metadata:
+      labels:
+        app: "{{ deploy.name }}"
+        lab: "{{ lab_prefix }}"
+    spec:
+      containers:
+        - name: app
+          image: "{{ deploy.image }}"
+          imagePullPolicy: "{{ deploy.pull_policy | default('Always') }}"
+          command: ["sleep", "infinity"]
+{% if deploy.env is defined %}
+          env:
+{% for e in deploy.env %}
+            - name: "{{ e.name }}"
+              value: "{{ e.value }}"
+{% endfor %}
+{% endif %}
+          resources:
+            requests:
+              memory: "{{ default_resources.requests.memory }}"
+              cpu: "{{ default_resources.requests.cpu }}"
+            limits:
+              memory: "{{ default_resources.limits.memory }}"
+              cpu: "{{ default_resources.limits.cpu }}"

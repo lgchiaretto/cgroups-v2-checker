@@ -2,7 +2,7 @@
 
 A web application that scans OpenShift clusters for container images with potential cgroups v2 compatibility issues before upgrading to OpenShift 4.19 (RHCOS 9, cgroups v2 mandatory).
 
-Uses **skopeo** for remote image metadata inspection without downloading layers.
+Runs a lightweight detection script inside each running pod via `oc exec` to check OS version, runtime versions (Java, Node.js, .NET), JVM flags, and cgroups v1 references.
 
 | [Documentacao em Portugues](README.pt-br.md) |
 |---|
@@ -17,64 +17,114 @@ This tool helps cluster administrators identify those images before the upgrade,
 
 ## Features
 
-- Three-level image analysis (name/tag rules + remote metadata via skopeo + pod exec runtime detection)
-- Severity classification: CRITICAL, HIGH, MEDIUM, LOW, INFO, OK, UNKNOWN
-- Inspection metadata audit trail (shows what skopeo found for each image)
-- Insufficient metadata detection (flags images that lack labels/OS identification)
+- Pod exec-based runtime detection: OS, Java, Node.js, .NET, JVM flags, cgroups v1 references
+- Optional skopeo fallback for images where exec fails (distroless/scratch images)
+- Severity classification: CRITICAL, HIGH, LOW, INFO, OK, UNKNOWN
+- Inspection metadata audit trail (shows what was detected for each image)
 - Clickable severity cards to filter the report table
 - Image drilldown modal showing pods and namespaces per image
 - Pagination for large image lists (20/50/100/All)
 - Text filter and severity filter buttons
-- Filter for images that failed skopeo inspection
 - CSV and JSON report download
-- Registry credentials management for private registries
+- Registry credentials management for private registries (used by skopeo fallback)
 - Skip reason breakdown for excluded pods (system namespaces vs. user-excluded)
 - Background scan with real-time progress reporting
 - PatternFly 6 dark theme (OpenShift Console style)
 
 ## How It Works
 
-### Level 1 -- Name/Tag Analysis
+### Pod Exec Inspection (primary)
 
-Lists all pods via the Kubernetes API and analyzes image names using detection rules:
+Lists all pods via the Kubernetes API, then executes a lightweight detection script inside each running pod via `oc exec`. The script is read-only and uses `command -v` checks before executing runtime commands.
 
-- **Problematic base images**: RHEL/CentOS 6/7, Debian < 11, Ubuntu < 20.04, Alpine < 3.14, Amazon Linux 1/2, Oracle Linux 7, SLES 12
-- **Outdated runtimes**: Java (< JDK 15), .NET (< 6), Node.js (< 16), Python 2, Go (< 1.19)
-- **Known software**: MySQL 5.x, PostgreSQL < 14, Elasticsearch < 8.x, Kafka < 3.x, Jenkins with JDK8, WildFly < 26, Tomcat < 10
+Detections performed:
 
-### Level 2 -- Remote Inspection via skopeo
+- **Operating System**: reads `/etc/os-release` to detect legacy OS (CentOS 7, RHEL 7, Ubuntu < 20.04, Debian < 11, Alpine < 3.14)
+- **Java**: runs `java -version` to get the real JDK version (safe: 17+, 11.0.16+, 8u372+)
+- **JVM Flags**: checks `JAVA_TOOL_OPTIONS`, `JAVA_OPTS`, `_JAVA_OPTIONS`, `JDK_JAVA_OPTIONS` for `-XX:-UseContainerSupport`
+- **Node.js**: runs `node --version` (safe: 20+)
+- **.NET**: runs `dotnet --list-runtimes` (safe: 5+)
+- **cgroups hierarchy**: checks if the pod runs under cgroups v1 or v2
+- **cgroups v1 file references**: searches application files for hardcoded v1 paths (`memory.limit_in_bytes`, `cpu.cfs_quota_us`, etc.)
+- **cgroups v1 env references**: checks PID 1 environment variables for v1 paths
 
-Uses `skopeo inspect docker://IMAGE` to read remote metadata (manifest and config JSON) without downloading layers:
+### Skopeo Fallback (optional)
 
-- OCI labels (`org.opencontainers.image.base.name`, `com.redhat.component`)
-- Environment variables (`JAVA_VERSION`, JVM flags)
-- References to cgroups v1 paths in CMD/Entrypoint
-- Direct cgroups v1 file references (`memory.limit_in_bytes`, etc.)
-- Red Hat middleware detection (JBoss EAP, Data Grid versions via labels)
-
-Images without base image labels or OS identification are flagged with "Insufficient Metadata" (LOW severity), recommending exec check or adding OCI labels. The JSON report includes an `inspection_metadata` block for each inspected image showing what skopeo found (label count, relevant labels, env vars), providing a clear audit trail for why an image was marked OK.
-
-### Level 3 -- Pod Exec Runtime Detection (optional)
-
-Executes a detection script inside running pods to check for cgroups v1 usage at runtime:
-
-- Whether the pod runs under cgroups v1 or v2 hierarchy
-- Application files that reference v1-specific paths
-- Environment variables referencing cgroups v1
+For images where exec fails (distroless/scratch images without a shell), skopeo can be used as a fallback to inspect image metadata remotely. Disabled by default.
 
 ### Severity Classification
 
-| Severity | Description |
-|---|---|
-| CRITICAL | Incompatible or EOL base image (RHEL 6/7, CentOS 7) |
-| HIGH | Runtime with serious cgroups v2 issues (Java < 11, Elasticsearch 6.x) |
-| MEDIUM | Possible issue, needs validation (Alpine < 3.14, .NET < 6) |
-| LOW | Low risk or insufficient metadata for validation |
-| INFO | Informational finding |
-| OK | No issues detected (metadata validated) |
-| UNKNOWN | Not inspected (skopeo disabled or failed) |
+#### CRITICAL -- Incompatible base OS, will break on cgroups v2
 
-Images found only in initContainers have their severity downgraded by one level.
+The operating system itself does not support cgroups v2. These containers **will fail** after the upgrade to OCP 4.19.
+
+Real-world examples:
+- `centos:7`, `quay.io/centos/centos:7` -- CentOS 7 (EOL June 2024), kernel and userspace tools only understand cgroups v1
+- `registry.access.redhat.com/ubi7/ubi:latest` -- UBI 7 / RHEL 7 based images
+- `registry.access.redhat.com/rhel6/rhel:latest` -- RHEL 6 based images
+- `ubuntu:18.04`, `ubuntu:16.04` -- Ubuntu versions before 20.04
+- `debian:10` (Buster), `debian:9` (Stretch) -- Debian versions before 11
+- `openjdk:8u302-jre-slim` -- Java 8 < 8u372 (cannot read container memory/CPU limits under cgroups v2)
+
+**Action required**: Rebuild the application on a supported base image (UBI 8/9, Ubuntu 22.04+, Debian 12+) **before** the upgrade.
+
+#### HIGH -- Runtime needs update, may cause issues on cgroups v2
+
+The base OS is compatible, but the application runtime has known cgroups v2 issues. The container will start, but the application may **behave incorrectly** (wrong memory limits, CPU throttling, OOM kills).
+
+Real-world examples:
+- `openjdk:11.0.11-jre-slim` -- Java 11 < 11.0.16 reads cgroups v1 paths for memory/CPU, gets host values instead of container limits
+- `registry.access.redhat.com/ubi8/nodejs-16:latest` -- Node.js 16 has limited cgroups v2 heap sizing
+- `registry.access.redhat.com/ubi9/nodejs-18:latest` -- Node.js 18 has partial cgroups v2 support, should upgrade to 20+
+- Alpine 3.13 or older with application runtimes -- musl libc < 1.2.2 has incomplete cgroups v2 support
+- Java 17 with `JAVA_TOOL_OPTIONS="-XX:-UseContainerSupport"` -- explicitly disables container awareness, JVM ignores cgroups limits
+- Application files referencing hardcoded cgroups v1 paths (`/sys/fs/cgroup/memory/memory.limit_in_bytes`, `/sys/fs/cgroup/cpu/cpu.cfs_quota_us`)
+- Environment variables pointing to cgroups v1 paths
+
+**Action required**: Update the runtime to a cgroups v2-compatible version or fix the configuration. Safe versions: Java 17+ / 11.0.16+ / 8u372+, Node.js 20+, .NET 6+.
+
+#### LOW -- Minor risk, review when convenient
+
+Low-risk findings or situations where metadata is insufficient for a definitive assessment.
+
+Real-world examples:
+- Insufficient metadata to determine full compatibility
+- Minor configuration items that are unlikely to cause failures
+
+**Action**: Review when convenient. These findings are unlikely to cause immediate issues during the upgrade.
+
+#### INFO -- Informational, no action needed
+
+Purely informational findings that provide context but do not indicate any risk.
+
+**Action**: No action required.
+
+#### OK -- Fully compatible with cgroups v2
+
+The image was inspected and no compatibility issues were found.
+
+Real-world examples:
+- `registry.access.redhat.com/ubi9/openjdk-17:latest` -- Java 17 on UBI 9
+- `registry.access.redhat.com/ubi9/openjdk-21:latest` -- Java 21 on UBI 9
+- `registry.access.redhat.com/ubi8/openjdk-8:1.18` -- Java 8u392+ (safe build)
+- `registry.access.redhat.com/ubi9/nodejs-20:latest` -- Node.js 20 on UBI 9
+- `registry.access.redhat.com/ubi9/ubi-minimal:latest` -- UBI 9 minimal (no runtime)
+- `registry.access.redhat.com/ubi8/ubi-minimal:latest` -- UBI 8 minimal
+
+#### UNKNOWN -- Could not inspect
+
+The checker was unable to inspect the image. Typically because `oc exec` failed (the pod crashed, the container has no shell, or permissions were denied) and skopeo fallback was not enabled.
+
+Real-world examples:
+- `gcr.io/distroless/java17-debian11` -- Distroless images have no shell, exec cannot run
+- Pods in `CrashLoopBackOff` or `Error` state
+- Containers with `securityContext.readOnlyRootFilesystem` and restricted exec permissions
+
+**Action**: Enable skopeo fallback to inspect these images via remote metadata, or verify them manually.
+
+---
+
+Images found only in initContainers are flagged in the report but receive the same severity as regular containers -- if the image has a problem, it needs to be fixed regardless of where it runs.
 
 ## Architecture
 
@@ -82,8 +132,8 @@ Images found only in initContainers have their severity downgraded by one level.
 Browser  -->  Flask (Gunicorn, PatternFly v6 dark theme)
                 |
                 +--> Kubernetes API (list pods, read cluster info)
-                +--> skopeo inspect docker://IMAGE (metadata only)
-                +--> pod exec (optional runtime detection)
+                +--> pod exec (primary: OS, runtimes, cgroups detection)
+                +--> skopeo inspect (optional fallback for exec failures)
                 +--> JSON reports saved to REPORT_DIR
 ```
 
@@ -95,7 +145,7 @@ The application runs inside the OpenShift cluster with a ServiceAccount that has
 app/
   app.py             Flask application factory
   config.py          Configuration via environment variables
-  scanner.py         Scanning engine (Kubernetes API + skopeo + exec)
+  scanner.py         Scanning engine (Kubernetes API + pod exec + skopeo fallback)
   routes.py          Web routes (dashboard, reports, CSV download)
   api.py             REST API (/api/scan, /api/reports, /api/registries)
   templates/         Jinja2 templates (PatternFly v6 dark theme)
@@ -406,8 +456,8 @@ Access `http://localhost:8080`. Uses the local kubeconfig (`~/.kube/config` or `
 | `SKIP_SYSTEM_NAMESPACES` | `true` | Skip openshift-* and kube-* namespaces |
 | `SKOPEO_TLS_VERIFY` | `true` | Verify TLS in skopeo calls |
 | `SKOPEO_AUTH_FILE` | (empty) | Auth file path for private registries |
-| `SKOPEO_MAX_WORKERS` | `20` | Parallel threads for skopeo inspection |
-| `EXEC_MAX_WORKERS` | `10` | Parallel threads for pod exec checks |
+| `SKOPEO_MAX_WORKERS` | `20` | Parallel threads for skopeo fallback inspection |
+| `EXEC_MAX_WORKERS` | `20` | Parallel threads for pod exec inspection |
 | `USE_IMAGE_PULL_SECRETS` | `true` | Extract registry auth from pods/ServiceAccounts |
 | `REGISTRIES_FILE` | (empty) | Path to mounted registries.json from K8s Secret |
 | `IMAGE_TAG` | `latest` | Image tag used by setup.sh |
@@ -431,7 +481,7 @@ Access `http://localhost:8080`. Uses the local kubeconfig (`~/.kube/config` or `
 ```bash
 curl -X POST http://ROUTE_URL/api/scan \
   -H "Content-Type: application/json" \
-  -d '{"namespaces": ["my-app"], "inspect_images": true, "exec_check": true}'
+  -d '{"namespaces": ["my-app"]}'
 ```
 
 ### Scan options
@@ -442,8 +492,7 @@ curl -X POST http://ROUTE_URL/api/scan \
 | `exclude_namespaces` | list | none | Namespaces to exclude |
 | `namespace_patterns` | list | none | Regex patterns to include namespaces |
 | `exclude_patterns` | list | none | Regex patterns to exclude namespaces |
-| `inspect_images` | bool | true | Enable skopeo remote inspection (Level 2) |
-| `exec_check` | bool | false | Enable pod exec runtime detection (Level 3) |
+| `skopeo_fallback` | bool | false | Enable skopeo fallback for images where exec fails |
 
 ## Container Image
 

@@ -1,0 +1,169 @@
+---
+lab_prefix: cgv2-lab
+kubeconfig: "{{ lookup('ansible.builtin.env', 'KUBECONFIG', default='~/.kube/config') }}"
+
+default_resources:
+  requests:
+    memory: "64Mi"
+    cpu: "50m"
+  limits:
+    memory: "128Mi"
+    cpu: "100m"
+
+namespaces:
+  # ── Java ────────────────────────────────────────────────────────────────
+  - name: java
+    deployments:
+      - name: java8-unsafe
+        image: docker.io/library/openjdk:8u302-jre-slim
+        pull_policy: IfNotPresent
+        expected: CRITICAL
+        description: "Java 8u302 — needs 8u372+"
+
+      - name: java11-unsafe
+        image: docker.io/library/openjdk:11.0.11-jre-slim
+        pull_policy: IfNotPresent
+        expected: HIGH
+        description: "Java 11.0.11 — needs 11.0.16+"
+
+      - name: java8-safe
+        image: registry.access.redhat.com/ubi8/openjdk-8:latest
+        expected: OK
+        description: "Red Hat OpenJDK 8 latest (8u492+)"
+
+      - name: java8-safe-pinned
+        image: registry.access.redhat.com/ubi8/openjdk-8:1.18
+        expected: OK
+        description: "Red Hat OpenJDK 8 build 1.18 (8u392+)"
+
+      - name: java17-safe
+        image: registry.access.redhat.com/ubi9/openjdk-17:latest
+        replicas: 3
+        expected: OK
+        description: "Java 17 — safe"
+
+      - name: java21-safe
+        image: registry.access.redhat.com/ubi9/openjdk-21:latest
+        replicas: 2
+        expected: OK
+        description: "Java 21 — safe"
+
+  # ── OS ──────────────────────────────────────────────────────────────────
+  - name: os
+    deployments:
+      - name: centos7-app
+        image: quay.io/centos/centos:7
+        expected: CRITICAL
+        description: "CentOS 7"
+
+      - name: ubi7-app
+        image: registry.access.redhat.com/ubi7/ubi:latest
+        expected: CRITICAL
+        description: "UBI 7 (RHEL 7)"
+
+      - name: ubi8-ok
+        image: registry.access.redhat.com/ubi8/ubi-minimal:latest
+        replicas: 3
+        expected: OK
+        description: "UBI 8 minimal"
+
+      - name: ubi9-ok
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        replicas: 5
+        expected: OK
+        description: "UBI 9 minimal"
+
+  # ── Node.js ─────────────────────────────────────────────────────────────
+  - name: node
+    deployments:
+      - name: node16-app
+        image: registry.access.redhat.com/ubi8/nodejs-16:latest
+        expected: HIGH
+        description: "Node.js 16 — needs 20+"
+
+      - name: node18-app
+        image: registry.access.redhat.com/ubi9/nodejs-18:latest
+        expected: HIGH
+        description: "Node.js 18 — needs 20+"
+
+      - name: node20-ok
+        image: registry.access.redhat.com/ubi9/nodejs-20:latest
+        replicas: 3
+        expected: OK
+        description: "Node.js 20 — safe"
+
+  # ── Edge cases ──────────────────────────────────────────────────────────
+  - name: mixed
+    deployments:
+      - name: multi-container
+        type: multi
+        containers:
+          - name: main-app
+            image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+          - name: sidecar-legacy
+            image: quay.io/centos/centos:7
+        expected: CRITICAL
+        description: "CentOS 7 sidecar"
+
+      - name: init-only
+        type: init
+        init_image: quay.io/centos/centos:7
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        expected: CRITICAL
+        description: "CentOS 7 initContainer — same severity as regular container"
+
+      - name: java-with-flags
+        image: registry.access.redhat.com/ubi9/openjdk-17:latest
+        env:
+          - name: JAVA_TOOL_OPTIONS
+            value: "-XX:-UseContainerSupport"
+        expected: HIGH
+        description: "Java 17 with -UseContainerSupport disabled"
+
+      - name: no-runtime
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        expected: OK
+        description: "UBI 9 no runtime"
+
+  # ── Workloads OK (volume) ───────────────────────────────────────────────
+  - name: apps-1
+    deployments:
+      - name: api-gateway
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        replicas: 2
+        expected: OK
+      - name: auth-service
+        image: registry.access.redhat.com/ubi9/openjdk-21:latest
+        replicas: 2
+        expected: OK
+      - name: order-service
+        image: registry.access.redhat.com/ubi9/openjdk-17:latest
+        replicas: 2
+        expected: OK
+      - name: notification-svc
+        image: registry.access.redhat.com/ubi9/nodejs-20:latest
+        replicas: 2
+        expected: OK
+      - name: frontend
+        image: registry.access.redhat.com/ubi9/nodejs-20:latest
+        replicas: 2
+        expected: OK
+
+  - name: apps-2
+    deployments:
+      - name: billing-api
+        image: registry.access.redhat.com/ubi9/openjdk-17:latest
+        replicas: 2
+        expected: OK
+      - name: report-worker
+        image: registry.access.redhat.com/ubi9/openjdk-21:latest
+        replicas: 2
+        expected: OK
+      - name: cache-proxy
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        replicas: 2
+        expected: OK
+      - name: metrics-collector
+        image: registry.access.redhat.com/ubi8/ubi-minimal:latest
+        replicas: 2
+        expected: OK

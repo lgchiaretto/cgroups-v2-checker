@@ -2,6 +2,8 @@
 
 Aplicacao web para varrer clusters OpenShift e identificar imagens de container com problemas de compatibilidade com cgroups v2 antes do upgrade para o OpenShift 4.19.
 
+Executa um script de deteccao leve dentro de cada pod em execucao via `oc exec` para verificar versao do SO, runtimes (Java, Node.js, .NET), flags JVM e referencias a cgroups v1.
+
 
 | [English Documentation](README.md) |
 | ---------------------------------- |
@@ -17,66 +19,114 @@ Esta ferramenta ajuda administradores de cluster a identificar essas imagens ant
 
 ## Funcionalidades
 
-- Analise de imagens em 3 niveis (regras de nome/tag + metadados remotos via skopeo + deteccao runtime via pod exec)
-- Classificacao de severidade: CRITICAL, HIGH, MEDIUM, LOW, INFO, OK, UNKNOWN
-- Trilha de auditoria de inspecao (mostra o que o skopeo encontrou para cada imagem)
-- Deteccao de metadados insuficientes (sinaliza imagens sem labels/identificacao de OS)
+- Deteccao via pod exec: SO, Java, Node.js, .NET, flags JVM, referencias a cgroups v1
+- Fallback opcional via skopeo para imagens onde exec falha (imagens distroless/scratch)
+- Classificacao de severidade: CRITICAL, HIGH, LOW, INFO, OK, UNKNOWN
+- Trilha de auditoria de inspecao (mostra o que foi detectado para cada imagem)
 - Cards de severidade clicaveis para filtrar a tabela de resultados
 - Modal de drilldown por imagem mostrando pods e namespaces
 - Paginacao para listas grandes (20/50/100/Todos)
 - Filtro por texto e botoes de filtro por severidade
-- Filtro para imagens que falharam na inspecao skopeo
 - Download de relatorio em CSV e JSON
-- Gerenciamento de credenciais de registry para registries privados
+- Gerenciamento de credenciais de registry para registries privados (usado pelo fallback skopeo)
 - Detalhamento de pods excluidos (namespaces de sistema vs. excluidos pelo usuario)
 - Scan em background com progresso em tempo real
 - Tema escuro PatternFly 6 (estilo OpenShift Console)
 
 ## Como Funciona
 
-### Nivel 1 -- Analise por nome/tag
+### Inspecao via Pod Exec (primaria)
 
-Lista todos os pods do cluster via API do Kubernetes e analisa os nomes das imagens usando regras de deteccao:
+Lista todos os pods do cluster via API do Kubernetes e executa um script de deteccao leve dentro de cada pod em execucao via `oc exec`. O script e somente leitura e usa `command -v` antes de executar comandos de runtime.
 
-- **Imagens base problematicas**: RHEL/CentOS 6/7, Debian < 11, Ubuntu < 20.04, Alpine < 3.14, Amazon Linux 1/2, Oracle Linux 7, SLES 12
-- **Runtimes desatualizados**: Java (< JDK 15), .NET (< 6), Node.js (< 16), Python 2, Go (< 1.19)
-- **Softwares conhecidos**: MySQL 5.x, PostgreSQL < 14, Elasticsearch < 8.x, Kafka < 3.x, Jenkins com JDK8, WildFly < 26, Tomcat < 10
+Deteccoes realizadas:
 
-### Nivel 2 -- Inspecao remota via skopeo
+- **Sistema Operacional**: le `/etc/os-release` para detectar SO legado (CentOS 7, RHEL 7, Ubuntu < 20.04, Debian < 11, Alpine < 3.14)
+- **Java**: executa `java -version` para obter a versao real do JDK (seguro: 17+, 11.0.16+, 8u372+)
+- **Flags JVM**: verifica `JAVA_TOOL_OPTIONS`, `JAVA_OPTS`, `_JAVA_OPTIONS`, `JDK_JAVA_OPTIONS` por `-XX:-UseContainerSupport`
+- **Node.js**: executa `node --version` (seguro: 20+)
+- **.NET**: executa `dotnet --list-runtimes` (seguro: 5+)
+- **Hierarquia cgroups**: verifica se o pod roda sob cgroups v1 ou v2
+- **Referencias a arquivos cgroups v1**: busca em arquivos da aplicacao por paths v1 hardcoded (`memory.limit_in_bytes`, `cpu.cfs_quota_us`, etc.)
+- **Referencias cgroups v1 em ENV**: verifica variaveis de ambiente do PID 1 por paths v1
 
-Utiliza `skopeo inspect docker://IMAGE` para ler metadados remotos (manifest e config JSON) sem baixar camadas:
+### Fallback via Skopeo (opcional)
 
-- Labels OCI (`org.opencontainers.image.base.name`, `com.redhat.component`)
-- Variaveis de ambiente (`JAVA_VERSION`, flags JVM)
-- Referencias a paths cgroups v1 no CMD/Entrypoint
-- Arquivos cgroups v1 referenciados (`memory.limit_in_bytes`, etc.)
-- Deteccao de middleware Red Hat (JBoss EAP, Data Grid via labels)
-
-Imagens sem labels de imagem base ou identificacao de OS sao sinalizadas com "Insufficient Metadata" (severidade LOW), recomendando exec check ou adicao de labels OCI. O relatorio JSON inclui um bloco `inspection_metadata` para cada imagem inspecionada, fornecendo uma trilha de auditoria clara.
-
-### Nivel 3 -- Deteccao em Runtime via pod exec (opcional)
-
-Executa um script de deteccao dentro dos pods em execucao para verificar uso de cgroups v1:
-
-- Se o pod roda sob hierarquia cgroups v1 ou v2
-- Arquivos da aplicacao que referenciam paths v1
-- Variaveis de ambiente referenciando cgroups v1
+Para imagens onde exec falha (imagens distroless/scratch sem shell), o skopeo pode ser usado como fallback para inspecionar metadados da imagem remotamente. Desabilitado por padrao.
 
 ### Classificacao de Severidade
 
+#### CRITICAL -- SO base incompativel, vai quebrar no cgroups v2
 
-| Severidade | Descricao                                                                 |
-| ---------- | ------------------------------------------------------------------------- |
-| CRITICAL   | Imagem base incompativel ou EOL (RHEL 6/7, CentOS 7)                      |
-| HIGH       | Runtime com problemas serios de cgroups v2 (Java < 11, Elasticsearch 6.x) |
-| MEDIUM     | Possivel problema, precisa validacao (Alpine < 3.14, .NET < 6)            |
-| LOW        | Risco baixo ou metadados insuficientes para validacao                     |
-| INFO       | Finding informativo                                                       |
-| OK         | Sem problemas detectados (metadados validados)                            |
-| UNKNOWN    | Nao inspecionado (skopeo desabilitado ou falhou)                          |
+O sistema operacional nao suporta cgroups v2. Esses containers **vao falhar** apos o upgrade para OCP 4.19.
 
+Exemplos reais:
+- `centos:7`, `quay.io/centos/centos:7` -- CentOS 7 (EOL junho 2024), kernel e ferramentas userspace so entendem cgroups v1
+- `registry.access.redhat.com/ubi7/ubi:latest` -- Imagens baseadas em UBI 7 / RHEL 7
+- `registry.access.redhat.com/rhel6/rhel:latest` -- Imagens baseadas em RHEL 6
+- `ubuntu:18.04`, `ubuntu:16.04` -- Versoes do Ubuntu anteriores a 20.04
+- `debian:10` (Buster), `debian:9` (Stretch) -- Versoes do Debian anteriores a 11
+- `openjdk:8u302-jre-slim` -- Java 8 < 8u372 (nao consegue ler limites de memoria/CPU do container sob cgroups v2)
 
-Imagens encontradas apenas em initContainers tem a severidade reduzida em um nivel.
+**Acao necessaria**: Reconstruir a aplicacao em uma imagem base compativel (UBI 8/9, Ubuntu 22.04+, Debian 12+) **antes** do upgrade.
+
+#### HIGH -- Runtime precisa de atualizacao, pode causar problemas no cgroups v2
+
+O SO base e compativel, mas o runtime da aplicacao tem problemas conhecidos com cgroups v2. O container vai iniciar, mas a aplicacao pode **se comportar incorretamente** (limites de memoria errados, throttling de CPU, OOM kills).
+
+Exemplos reais:
+- `openjdk:11.0.11-jre-slim` -- Java 11 < 11.0.16 le paths de cgroups v1 para memoria/CPU, obtem valores do host em vez dos limites do container
+- `registry.access.redhat.com/ubi8/nodejs-16:latest` -- Node.js 16 tem suporte limitado a cgroups v2 para dimensionamento de heap
+- `registry.access.redhat.com/ubi9/nodejs-18:latest` -- Node.js 18 tem suporte parcial a cgroups v2, deve atualizar para 20+
+- Alpine 3.13 ou anterior com runtimes -- musl libc < 1.2.2 tem suporte incompleto a cgroups v2
+- Java 17 com `JAVA_TOOL_OPTIONS="-XX:-UseContainerSupport"` -- desabilita explicitamente a deteccao de container, JVM ignora limites de cgroups
+- Arquivos da aplicacao referenciando paths cgroups v1 hardcoded (`/sys/fs/cgroup/memory/memory.limit_in_bytes`, `/sys/fs/cgroup/cpu/cpu.cfs_quota_us`)
+- Variaveis de ambiente apontando para paths de cgroups v1
+
+**Acao necessaria**: Atualizar o runtime para uma versao compativel com cgroups v2 ou corrigir a configuracao. Versoes seguras: Java 17+ / 11.0.16+ / 8u372+, Node.js 20+, .NET 6+.
+
+#### LOW -- Risco menor, revisar quando conveniente
+
+Findings de baixo risco ou situacoes onde os metadados sao insuficientes para uma avaliacao definitiva.
+
+Exemplos reais:
+- Metadados insuficientes para determinar compatibilidade completa
+- Itens de configuracao menores que dificilmente causarao falhas
+
+**Acao**: Revisar quando conveniente. Esses findings dificilmente causarao problemas imediatos durante o upgrade.
+
+#### INFO -- Informativo, nenhuma acao necessaria
+
+Findings puramente informativos que fornecem contexto mas nao indicam risco.
+
+**Acao**: Nenhuma acao necessaria.
+
+#### OK -- Totalmente compativel com cgroups v2
+
+A imagem foi inspecionada e nenhum problema de compatibilidade foi encontrado.
+
+Exemplos reais:
+- `registry.access.redhat.com/ubi9/openjdk-17:latest` -- Java 17 no UBI 9
+- `registry.access.redhat.com/ubi9/openjdk-21:latest` -- Java 21 no UBI 9
+- `registry.access.redhat.com/ubi8/openjdk-8:1.18` -- Java 8u392+ (build seguro)
+- `registry.access.redhat.com/ubi9/nodejs-20:latest` -- Node.js 20 no UBI 9
+- `registry.access.redhat.com/ubi9/ubi-minimal:latest` -- UBI 9 minimal (sem runtime)
+- `registry.access.redhat.com/ubi8/ubi-minimal:latest` -- UBI 8 minimal
+
+#### UNKNOWN -- Nao foi possivel inspecionar
+
+O checker nao conseguiu inspecionar a imagem. Geralmente porque o `oc exec` falhou (o pod crashou, o container nao tem shell, ou permissoes foram negadas) e o fallback via skopeo nao estava habilitado.
+
+Exemplos reais:
+- `gcr.io/distroless/java17-debian11` -- Imagens distroless nao tem shell, exec nao consegue executar
+- Pods em estado `CrashLoopBackOff` ou `Error`
+- Containers com `securityContext.readOnlyRootFilesystem` e permissoes de exec restritas
+
+**Acao**: Habilitar o fallback via skopeo para inspecionar essas imagens via metadados remotos, ou verificar manualmente.
+
+---
+
+Imagens encontradas apenas em initContainers sao sinalizadas no relatorio mas recebem a mesma severidade que containers regulares -- se a imagem tem problema, precisa ser corrigida independente de onde roda.
 
 ## Arquitetura
 
@@ -84,8 +134,8 @@ Imagens encontradas apenas em initContainers tem a severidade reduzida em um niv
 Browser  -->  Flask (Gunicorn, PatternFly v6 dark theme)
                 |
                 +--> Kubernetes API (list pods, get cluster info)
-                +--> skopeo inspect docker://IMAGE (metadata only, no pull)
-                +--> pod exec (deteccao runtime opcional)
+                +--> pod exec (primario: SO, runtimes, deteccao cgroups)
+                +--> skopeo inspect (fallback opcional para falhas de exec)
                 +--> JSON reports salvos em /app/data/reports/
 ```
 
@@ -97,7 +147,7 @@ A aplicacao roda dentro do cluster OpenShift com uma ServiceAccount que tem perm
 app/
   app.py             Flask application factory
   config.py          Configuracao via variaveis de ambiente
-  scanner.py         Motor de varredura (Kubernetes API + skopeo + exec)
+  scanner.py         Motor de varredura (Kubernetes API + pod exec + skopeo fallback)
   routes.py          Rotas web (dashboard, relatorios, CSV)
   api.py             API REST (/api/scan, /api/reports, /api/registries)
   templates/         Templates Jinja2 (PatternFly v6 dark theme)
@@ -419,8 +469,8 @@ Acesse `http://localhost:8080`. A conexao ao cluster usa o kubeconfig local (`~/
 | `SKIP_SYSTEM_NAMESPACES` | `true`                   | Pular namespaces de sistema do OpenShift            |
 | `SKOPEO_TLS_VERIFY`      | `true`                   | Verificar TLS nas chamadas do skopeo                |
 | `SKOPEO_AUTH_FILE`       | (vazio)                  | Arquivo de autenticacao para registries privados    |
-| `SKOPEO_MAX_WORKERS`     | `20`                     | Threads paralelas para inspecao via skopeo          |
-| `EXEC_MAX_WORKERS`       | `10`                     | Threads paralelas para exec checks em pods          |
+| `SKOPEO_MAX_WORKERS`     | `20`                     | Threads paralelas para inspecao fallback via skopeo |
+| `EXEC_MAX_WORKERS`       | `20`                     | Threads paralelas para inspecao via pod exec        |
 | `USE_IMAGE_PULL_SECRETS` | `true`                   | Extrair auth de registries dos pods/ServiceAccounts |
 | `REGISTRIES_FILE`        | (vazio)                  | Caminho para registries.json montado de K8s Secret  |
 | `IMAGE_TAG`              | `latest`                 | Tag da imagem usada pelo setup.sh                   |
@@ -447,20 +497,19 @@ Acesse `http://localhost:8080`. A conexao ao cluster usa o kubeconfig local (`~/
 ```bash
 curl -X POST http://cgroups-v2-checker-route/api/scan \
   -H "Content-Type: application/json" \
-  -d '{"namespaces": ["my-app"], "inspect_images": true, "exec_check": true}'
+  -d '{"namespaces": ["my-app"]}'
 ```
 
 ### Opcoes de varredura
 
 
-| Campo                | Tipo | Padrao | Descricao                                         |
-| -------------------- | ---- | ------ | ------------------------------------------------- |
-| `namespaces`         | list | todos  | Namespaces especificos para varrer                |
-| `exclude_namespaces` | list | nenhum | Namespaces para excluir                           |
-| `namespace_patterns` | list | nenhum | Padroes regex para incluir namespaces             |
-| `exclude_patterns`   | list | nenhum | Padroes regex para excluir namespaces             |
-| `inspect_images`     | bool | true   | Habilitar inspecao via skopeo (Nivel 2)           |
-| `exec_check`         | bool | false  | Habilitar deteccao runtime via pod exec (Nivel 3) |
+| Campo                | Tipo | Padrao | Descricao                                                    |
+| -------------------- | ---- | ------ | ------------------------------------------------------------ |
+| `namespaces`         | list | todos  | Namespaces especificos para varrer                           |
+| `exclude_namespaces` | list | nenhum | Namespaces para excluir                                      |
+| `namespace_patterns` | list | nenhum | Padroes regex para incluir namespaces                        |
+| `exclude_patterns`   | list | nenhum | Padroes regex para excluir namespaces                        |
+| `skopeo_fallback`    | bool | false  | Habilitar fallback via skopeo para imagens onde exec falha   |
 
 
 ## Imagem Container

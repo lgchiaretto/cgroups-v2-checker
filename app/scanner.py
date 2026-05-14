@@ -2,7 +2,12 @@
 cgroups v2 Compatibility Scanner Engine
 ========================================
 Scans OpenShift clusters for container images that may have cgroups v2
-compatibility issues. Uses skopeo for remote metadata inspection (no layer pull).
+compatibility issues. Uses pod exec as the primary detection method —
+runs a lightweight script inside each pod to detect OS version, runtime
+versions (Java, Node.js, .NET), and cgroups v1 references.
+
+Optionally falls back to skopeo for images where exec is not possible
+(initContainers, distroless/scratch images without a shell).
 """
 
 import base64
@@ -29,49 +34,9 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Detection rules
 # ─────────────────────────────────────────────────────────────────────────────
-
-KNOWN_PROBLEMATIC_BASES = {
-    r"(^|/)rhel7|redhat/ubi7|centos:7|centos/centos7|centos7": (
-        "RHEL/CentOS 7", "CRITICAL",
-        "Migrate to UBI 8/9 or RHEL 8/9. RHEL 7 does not support cgroups v2.",
-    ),
-    r"centos:6|centos/centos6|centos6|rhel6": (
-        "RHEL/CentOS 6", "CRITICAL",
-        "Urgently migrate to UBI 8/9. RHEL 6 is EOL and has no cgroups v2 support.",
-    ),
-    r"ubuntu:(14\.|16\.|18\.)": (
-        "Ubuntu < 20.04", "HIGH",
-        "Migrate to Ubuntu 20.04+ (Focal) or 22.04+ (Jammy).",
-    ),
-    r"debian:(8|9|10|jessie|stretch|buster)": (
-        "Debian < 11 (Bullseye)", "HIGH",
-        "Migrate to Debian 11 (Bullseye) or later.",
-    ),
-    r"alpine:(3\.[0-9](?:\.|$)|3\.1[0-3])": (
-        "Alpine < 3.14", "MEDIUM",
-        "Consider migrating to Alpine 3.14+.",
-    ),
-    r"amazonlinux:1|amzn1": (
-        "Amazon Linux 1", "CRITICAL",
-        "Migrate to Amazon Linux 2023. AL1 is EOL.",
-    ),
-    r"amazonlinux:2(?!\d)|amzn2": (
-        "Amazon Linux 2", "MEDIUM",
-        "Check compatibility. Consider Amazon Linux 2023.",
-    ),
-    r"oraclelinux:7|ol7": (
-        "Oracle Linux 7", "CRITICAL",
-        "Migrate to Oracle Linux 8/9.",
-    ),
-    r"sles:12|suse.*:12": (
-        "SLES 12", "HIGH",
-        "Migrate to SLES 15.",
-    ),
-}
 
 JAVA_SAFE_VERSIONS = "JDK 17+, JDK 11.0.16+, JDK 8u372+"
 JAVA_DETAIL = (
@@ -81,6 +46,15 @@ JAVA_DETAIL = (
     "causing excessive threads, CPU throttling, and latency. "
     "See: developers.redhat.com/articles/2025/11/27/how-does-cgroups-v2-impact-java-net-and-nodejs-openshift-4"
 )
+
+KNOWN_PROBLEMATIC_OS = {
+    ("centos", "7"): ("CentOS 7", "CRITICAL", "Migrate to UBI 8/9 or RHEL 8/9. CentOS 7 is EOL and has no cgroups v2 support."),
+    ("rhel", "7"): ("RHEL 7", "CRITICAL", "Migrate to UBI 8/9. RHEL 7 does not support cgroups v2."),
+    ("centos", "6"): ("CentOS 6", "CRITICAL", "Urgently migrate to UBI 8/9. CentOS 6 is EOL."),
+    ("rhel", "6"): ("RHEL 6", "CRITICAL", "Urgently migrate to UBI 8/9. RHEL 6 is EOL."),
+    ("ol", "7"): ("Oracle Linux 7", "CRITICAL", "Migrate to Oracle Linux 8/9."),
+    ("amzn", "1"): ("Amazon Linux 1", "CRITICAL", "Migrate to Amazon Linux 2023. AL1 is EOL."),
+}
 
 CGROUPS_V1_PATHS = [
     "/sys/fs/cgroup/memory/", "/sys/fs/cgroup/cpu/",
@@ -100,18 +74,37 @@ CGROUPS_V1_FILES = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pod exec cgroups v1 detection script
+# Pod exec inspection script
 # ─────────────────────────────────────────────────────────────────────────────
-# This script is executed inside running pods to detect cgroups v1 usage
-# at runtime. It checks:
-# 1. Whether the pod runs under cgroups v1 or v2 hierarchy
-# 2. Which v1-specific directories exist in /sys/fs/cgroup
-# 3. Application files that reference v1-specific paths (with timeout & depth limit)
-# 4. Environment variables referencing cgroups v1
+# This is the primary detection method. Executed inside each running pod to
+# detect cgroups v2 compatibility issues at runtime.
 #
-# Performance: script uses a single combined grep with maxdepth=3, size<1MB,
-# and a 5-second timeout to avoid hanging on large containers.
-_EXEC_CHECK_SCRIPT = (
+# Sections:
+#   OS       — /etc/os-release to detect legacy OS (RHEL/CentOS 7, etc.)
+#   JAVA     — java -version for real JDK version (not just ENV metadata)
+#   JVMFLAGS — JVM env vars that may disable container support
+#   NODE     — node --version for Node.js version
+#   DOTNET   — dotnet --list-runtimes for .NET version
+#   TYPE     — cgroups v1 vs v2 hierarchy
+#   V1DIRS   — which v1-specific directories exist
+#   V1REFS   — application files that reference v1 paths (timeout-protected)
+#   ENVREF   — environment variables referencing cgroups v1
+#
+# Safety: all commands are read-only. `command -v` checks binary existence
+# before execution to avoid noisy stderr. find+grep uses timeout 3s,
+# maxdepth 3, size < 1MB to avoid hanging on large containers.
+_EXEC_INSPECT_SCRIPT = (
+    'echo "===OS===";'
+    'cat /etc/os-release 2>/dev/null | grep -E "^(ID|VERSION_ID|PRETTY_NAME)=" || '
+    'cat /etc/redhat-release 2>/dev/null || echo "unknown";'
+    'echo "===JAVA===";'
+    'command -v java >/dev/null 2>&1 && java -version 2>&1 || echo "NOT_FOUND";'
+    'echo "===JVMFLAGS===";'
+    'printenv JAVA_TOOL_OPTIONS JAVA_OPTS _JAVA_OPTIONS JDK_JAVA_OPTIONS 2>/dev/null; echo;'
+    'echo "===NODE===";'
+    'command -v node >/dev/null 2>&1 && node --version 2>/dev/null || echo "NOT_FOUND";'
+    'echo "===DOTNET===";'
+    'command -v dotnet >/dev/null 2>&1 && dotnet --list-runtimes 2>/dev/null | head -5 || echo "NOT_FOUND";'
     'echo "===TYPE===";'
     '[ -f /sys/fs/cgroup/cgroup.controllers ] && echo "v2" || echo "v1";'
     'echo "===V1DIRS===";'
@@ -120,8 +113,7 @@ _EXEC_CHECK_SCRIPT = (
     ' [ -d "/sys/fs/cgroup/$d" ] && echo "/sys/fs/cgroup/$d";'
     'done;'
     'echo "===V1REFS===";'
-    # Single find+grep: maxdepth 3, text files <1MB, 5s timeout
-    'timeout 5 find /etc /opt /app /home -maxdepth 3 -type f -size -1M '
+    'timeout 3 find /etc /opt /app /home -maxdepth 3 -type f -size -1M '
     '-exec grep -lE "sys/fs/cgroup/(memory|cpu|cpuacct|blkio)/|'
     'memory\\.limit_in_bytes|cpu\\.cfs_quota_us|cpu\\.shares|cpuacct\\." {} + '
     '2>/dev/null | head -20 || true;'
@@ -130,7 +122,7 @@ _EXEC_CHECK_SCRIPT = (
     'echo "===DONE==="'
 )
 
-_EXEC_MAX_WORKERS = int(os.environ.get("EXEC_MAX_WORKERS", "10"))
+_EXEC_MAX_WORKERS = int(os.environ.get("EXEC_MAX_WORKERS", "20"))
 _EXEC_TIMEOUT = 15
 
 
@@ -167,22 +159,23 @@ class ImageReport:
     findings: List[Finding] = field(default_factory=list)
     inspected: bool = False
     inspection_error: str = ""
-    exec_checked: bool = False
     only_in_init: bool = False
     inspection_metadata: Dict = field(default_factory=dict)
 
     @property
     def max_severity(self) -> str:
-        order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+        order = {"CRITICAL": 0, "HIGH": 1, "LOW": 2, "INFO": 3}
         if not self.findings:
-            if not self.inspected and not self.exec_checked:
+            if self.only_in_init:
+                return "OK"
+            if not self.inspected:
                 return "UNKNOWN"
             return "OK"
         return min(self.findings, key=lambda f: order.get(f.severity, 99)).severity
 
     @property
     def severity_sort_key(self) -> int:
-        order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "UNKNOWN": 5, "OK": 6}
+        order = {"CRITICAL": 0, "HIGH": 1, "LOW": 2, "INFO": 3, "UNKNOWN": 4, "OK": 5}
         return order.get(self.max_severity, 99)
 
     def to_dict(self) -> dict:
@@ -197,7 +190,6 @@ class ImageReport:
             "pod_count": len(self.pods),
             "inspected": self.inspected,
             "inspection_error": self.inspection_error,
-            "exec_checked": self.exec_checked,
             "findings": [f.to_dict() for f in self.findings],
         }
         if self.inspection_metadata:
@@ -252,9 +244,12 @@ OPENSHIFT_SYSTEM_NS = {
 # Scanner class
 # ─────────────────────────────────────────────────────────────────────────────
 class CGroupsV2Scanner:
-    """Scans an OpenShift cluster for cgroups v2 compatibility issues."""
+    """Scans an OpenShift cluster for cgroups v2 compatibility issues.
 
-    # Kubernetes API pagination limit (avoids large single responses on big clusters)
+    Primary detection is via pod exec (runs a script inside each pod).
+    Skopeo is an optional fallback for images where exec fails.
+    """
+
     _K8S_PAGE_SIZE = 500
 
     def __init__(
@@ -264,8 +259,7 @@ class CGroupsV2Scanner:
         namespace_patterns: Optional[List[str]] = None,
         exclude_patterns: Optional[List[str]] = None,
         skip_system_ns: bool = True,
-        inspect_images: bool = True,
-        exec_check: bool = False,
+        skopeo_fallback: bool = False,
         skopeo_tls_verify: bool = True,
         skopeo_auth_file: str = "",
         max_workers: int = 20,
@@ -274,12 +268,10 @@ class CGroupsV2Scanner:
     ):
         self.target_namespaces = namespaces
         self.exclude_namespaces = set(exclude_namespaces or [])
-        # Compiled regex patterns for namespace include/exclude
         self._ns_include_patterns = self._compile_patterns(namespace_patterns)
         self._ns_exclude_patterns = self._compile_patterns(exclude_patterns)
         self.skip_system_ns = skip_system_ns
-        self.inspect_images = inspect_images
-        self.exec_check = exec_check
+        self.skopeo_fallback = skopeo_fallback
         self.skopeo_tls_verify = skopeo_tls_verify
         self.skopeo_auth_file = skopeo_auth_file
         self.max_workers = max_workers
@@ -290,16 +282,10 @@ class CGroupsV2Scanner:
         self.cluster_info: Dict[str, str] = {}
         self._sa_token: Optional[str] = None
         self._internal_registry: Optional[str] = None
-        # Registry -> auth credentials extracted from ImagePullSecrets
         self._registry_auths: Dict[str, dict] = {}
-        # Tracks which image pull secrets have already been processed
         self._processed_pull_secrets: Set[str] = set()
-        # Map image -> (namespace, pod_name, container_name) for exec checks
         self._image_pod_map: Dict[str, Tuple[str, str, str]] = {}
         self._api_client: Optional[client.ApiClient] = None
-        # Images where JAVA_VERSION env var lacks the update suffix (e.g. "1.8.0")
-        # and need a targeted `java -version` exec to resolve the real version
-        self._java_version_unresolved: Set[str] = set()
 
     @staticmethod
     def _compile_patterns(patterns: Optional[List[str]]) -> List[re.Pattern]:
@@ -316,13 +302,11 @@ class CGroupsV2Scanner:
         return compiled
 
     def _namespace_included(self, ns: str) -> bool:
-        """Check if namespace matches include patterns (if any are defined)."""
         if not self._ns_include_patterns:
-            return True  # no include patterns = include all
+            return True
         return any(p.search(ns) for p in self._ns_include_patterns)
 
     def _namespace_excluded(self, ns: str) -> bool:
-        """Check if namespace matches exclude patterns."""
         if ns in self.exclude_namespaces:
             return True
         return any(p.search(ns) for p in self._ns_exclude_patterns)
@@ -347,11 +331,6 @@ class CGroupsV2Scanner:
             config.load_kube_config()
             logger.info("Using local kubeconfig.")
 
-        # Kubernetes client >= 28 falls back to HTTPS_PROXY env var when
-        # Configuration.proxy is None. urllib3 may also read proxy env vars
-        # at request time (not just at client creation). Setting proxy to ""
-        # explicitly disables proxy at the Configuration level, which is
-        # authoritative regardless of env vars.
         cfg = client.Configuration.get_default_copy()
         cfg.proxy = ""
         proxy_env = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or \
@@ -421,12 +400,7 @@ class CGroupsV2Scanner:
     # Kubernetes API paginated listing
     # ─────────────────────────────────────────────────────────────────────
     def _list_pods_paginated(self, namespace: Optional[str] = None) -> List:
-        """List pods with pagination to avoid API timeouts on large clusters.
-
-        Uses continue tokens to paginate through results in batches of
-        _K8S_PAGE_SIZE. This prevents overwhelming the API server when
-        clusters have thousands of pods (>500 nodes).
-        """
+        """List pods with pagination to avoid API timeouts on large clusters."""
         all_pods = []
         _continue = None
 
@@ -454,26 +428,19 @@ class CGroupsV2Scanner:
         return all_pods
 
     # ─────────────────────────────────────────────────────────────────────
-    # ImagePullSecrets extraction
+    # ImagePullSecrets extraction (kept for skopeo fallback)
     # ─────────────────────────────────────────────────────────────────────
     def _extract_pull_secrets_for_pod(self, pod) -> None:
-        """Extract registry credentials from the pod's ImagePullSecrets.
-
-        Reads the ImagePullSecrets referenced by the pod (including those
-        inherited from its ServiceAccount) and merges their .dockerconfigjson
-        credentials into _registry_auths for use by skopeo.
-        """
+        """Extract registry credentials from the pod's ImagePullSecrets."""
         if not self.use_image_pull_secrets:
             return
 
         ns = pod.metadata.namespace
         secret_refs = []
 
-        # Direct imagePullSecrets on the pod spec
         if pod.spec.image_pull_secrets:
             secret_refs.extend(pod.spec.image_pull_secrets)
 
-        # ImagePullSecrets from the pod's ServiceAccount
         sa_name = pod.spec.service_account_name or "default"
         try:
             sa = self.v1.read_namespaced_service_account(sa_name, ns)
@@ -493,7 +460,6 @@ class CGroupsV2Scanner:
                 if not secret.data:
                     continue
 
-                # Support both .dockerconfigjson and .dockercfg formats
                 raw = (
                     secret.data.get(".dockerconfigjson")
                     or secret.data.get(".dockercfg")
@@ -511,23 +477,16 @@ class CGroupsV2Scanner:
                 logger.debug(f"Could not read pull secret {secret_key}: {e}")
 
     def _build_auth_file_for_image(self, image: str) -> Optional[str]:
-        """Build a temporary auth file for skopeo if we have credentials for the image's registry.
-
-        Returns the path to the temp auth file, or None if no matching credentials found.
-        The caller is responsible for cleaning up the temp file.
-        """
+        """Build a temporary auth file for skopeo if we have credentials."""
         if not self._registry_auths:
             return None
 
-        # Extract registry hostname from image reference
         registry = self._get_registry_from_image(image)
         if not registry:
             return None
 
-        # Look for matching credentials (try exact match, then with/without port)
         creds = None
         for reg_key, reg_creds in self._registry_auths.items():
-            # Normalize: strip https:// prefixes for comparison
             normalized_key = reg_key.replace("https://", "").replace("http://", "").rstrip("/")
             if registry == normalized_key or registry.split(":")[0] == normalized_key.split(":")[0]:
                 creds = reg_creds
@@ -536,7 +495,6 @@ class CGroupsV2Scanner:
         if not creds:
             return None
 
-        # Write temporary auth file in dockerconfigjson format
         auth_data = {"auths": {registry: creds}}
         tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
         json.dump(auth_data, tmp)
@@ -546,29 +504,19 @@ class CGroupsV2Scanner:
     @staticmethod
     def _get_registry_from_image(image: str) -> Optional[str]:
         """Extract registry hostname from an image reference."""
-        # Remove tag/digest
         ref = image.split("@")[0].split(":")[0] if "@" in image else image.rsplit(":", 1)[0]
         parts = ref.split("/")
-        # Images like "nginx" or "library/nginx" are Docker Hub
         if len(parts) == 1:
             return "docker.io"
-        # If first part has a dot or colon, it is a registry
         if "." in parts[0] or ":" in parts[0]:
             return parts[0]
-        # Otherwise assume Docker Hub (e.g., "myuser/myimage")
         return "docker.io"
 
     # ─────────────────────────────────────────────────────────────────────
     # Image collection
     # ─────────────────────────────────────────────────────────────────────
     def collect_images(self):
-        """Collect all container images from pods.
-
-        Uses paginated API calls to handle large clusters efficiently.
-        Tracks initContainers separately from regular containers so that
-        findings can indicate reduced severity for init-only images.
-        Also extracts ImagePullSecrets for use by skopeo.
-        """
+        """Collect all container images from pods."""
         self._report_progress("collect", 0, 1, "Listing pods (paginated)...")
 
         if self.target_namespaces:
@@ -600,9 +548,6 @@ class CGroupsV2Scanner:
                 skipped_pattern += 1
                 continue
 
-            # Only consider pods in Running phase. Pods in Pending, Succeeded,
-            # Failed or Unknown phases are skipped to avoid noise from images
-            # that aren't actively running on the cluster.
             is_running = bool(pod.status and pod.status.phase == "Running")
             if not is_running:
                 skipped += 1
@@ -612,10 +557,9 @@ class CGroupsV2Scanner:
             total_pods += 1
             pod_name = pod.metadata.name
 
-            # Extract ImagePullSecrets for registry authentication
-            self._extract_pull_secrets_for_pod(pod)
+            if self.skopeo_fallback:
+                self._extract_pull_secrets_for_pod(pod)
 
-            # Process initContainers (tracked separately for severity differentiation)
             if pod.spec.init_containers:
                 for c in pod.spec.init_containers:
                     if not c.image:
@@ -628,7 +572,6 @@ class CGroupsV2Scanner:
                     r.pods.add(f"{ns}/{pod_name}")
                     r.init_containers.add(c.name)
 
-            # Process regular containers
             if pod.spec.containers:
                 for c in pod.spec.containers:
                     if not c.image:
@@ -640,11 +583,9 @@ class CGroupsV2Scanner:
                     r.namespaces.add(ns)
                     r.pods.add(f"{ns}/{pod_name}")
                     r.containers.add(c.name)
-                    # Track first running pod per image for exec checks
                     if is_running and img not in self._image_pod_map:
                         self._image_pod_map[img] = (ns, pod_name, c.name)
 
-        # Mark images that appear ONLY in initContainers
         for report in self.image_reports.values():
             if report.init_containers and not report.containers:
                 report.only_in_init = True
@@ -669,7 +610,7 @@ class CGroupsV2Scanner:
         self._report_progress("collect", 1, 1,
             f"{total_pods} pods, {len(self.image_reports)} unique images")
         logger.info(f"Collected {total_pods} pods, {len(self.image_reports)} unique images "
-                     f"(skipped {skipped} system pods, "
+                     f"(skipped {skipped} pods, "
                      f"{len(self._registry_auths)} registry credentials loaded)")
 
     @staticmethod
@@ -683,591 +624,71 @@ class CGroupsV2Scanner:
     # Analysis
     # ─────────────────────────────────────────────────────────────────────
     def analyze(self):
-        """Run full analysis on all collected images."""
-        total = len(self.image_reports)
+        """Run full analysis on all collected images.
 
-        # Level 1: name/tag analysis
-        for idx, (img, report) in enumerate(self.image_reports.items(), 1):
-            self._report_progress("analyze", idx, total, f"Name analysis: {img[:60]}")
-            self._analyze_name(report)
-
-        # Level 2: skopeo remote inspection (with cache)
-        if self.inspect_images and self._check_skopeo():
-            self._skopeo_inspect_all()
-
-        # Resolve ambiguous Java versions (e.g. JAVA_VERSION=1.8.0 without
-        # update suffix) by running `java -version` inside pods.
-        # Runs automatically regardless of exec_check flag.
-        if self._java_version_unresolved:
-            self._verify_java_versions()
-
-        # Level 3: pod exec cgroups v1 runtime detection
-        if self.exec_check:
-            self._exec_check_all()
-
-        # Post-processing: reduce severity for initContainer-only images
-        self._apply_init_container_severity_downgrade()
-
-    def _check_skopeo(self) -> bool:
-        try:
-            result = subprocess.run(
-                ["skopeo", "--version"], capture_output=True, text=True, timeout=10,
-            )
-            return result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            logger.warning("skopeo not found — remote inspection disabled.")
-            return False
-
-    # ── Level 1: name/tag analysis ──────────────────────────────────────
-    def _analyze_name(self, report: ImageReport):
-        image = report.image.lower()
-        self._check_base_image(report, image)
-        self._check_runtime_versions(report, image)
-        self._check_known_problematic(report, image)
-
-    def _check_base_image(self, report: ImageReport, img: str):
-        for pattern, (name, sev, rec) in KNOWN_PROBLEMATIC_BASES.items():
-            if re.search(pattern, img):
-                report.findings.append(Finding("Base Image", sev,
-                    f"Base image identified as {name}", rec,
-                    f"Image: {report.image}"))
-
-    def _check_runtime_versions(self, report: ImageReport, img: str):
-        # Java — check both new-style (jdk-17, openjdk:11) and old-style (openjdk:1.8.0_412)
-        java_prefix = r"(?:openjdk|jdk|java|eclipse-temurin|amazoncorretto|liberica|zulu)"
-        # Old-style tag: openjdk:1.8.0_412 or openjdk:1.8.0
-        m_old = re.search(java_prefix + r"[:\-_]1\.(\d+)\.0(?:[_\-](\d+))?", img)
-        # New-style tag: openjdk:17, jdk-11.0.16
-        m_new = re.search(java_prefix + r"[:\-_]?(\d+)(?:[.\-_](\d+))?(?:[.\-_](\d+))?", img)
-
-        if m_old:
-            major = int(m_old.group(1))
-            update = int(m_old.group(2)) if m_old.group(2) else -1
-            if major == 8 and update < 0:
-                self._java_version_unresolved.add(report.image)
-            else:
-                safe = (major >= 15 or
-                        (major == 11 and update >= 16) or
-                        (major == 8 and update >= 372))
-                if not safe:
-                    sev = "HIGH" if major < 11 else "MEDIUM"
-                    report.findings.append(Finding("Java Runtime", sev,
-                        f"Java {major} detected — may not recognize cgroups v2 limits",
-                        f"{JAVA_DETAIL} Safe versions: {JAVA_SAFE_VERSIONS}",
-                        f"Tag version: {m_old.group(0)}"))
-        elif m_new:
-            major, minor, patch = int(m_new.group(1)), int(m_new.group(2) or 0), int(m_new.group(3) or 0)
-            safe = (major >= 15 or
-                    (major == 11 and (minor > 0 or patch >= 16)) or
-                    (major == 8 and patch >= 372))
-            if not safe:
-                sev = "HIGH" if major < 11 else "MEDIUM"
-                report.findings.append(Finding("Java Runtime", sev,
-                    f"Java {major} detected — may not recognize cgroups v2 limits",
-                    f"{JAVA_DETAIL} Safe versions: {JAVA_SAFE_VERSIONS}",
-                    f"Tag version: {m_new.group(0)}"))
-
-        # .NET — .NET 5+ is fully cgroups v2 compatible (since 2020)
-        m = re.search(r"(?:dotnet|aspnet|dotnet-runtime)[:\-/](\d+)\.(\d+)", img)
-        if m and int(m.group(1)) < 5:
-            report.findings.append(Finding(".NET Runtime", "HIGH",
-                f".NET {m.group(1)}.{m.group(2)} — no cgroups v2 support",
-                "Migrate to .NET 5+ (recommended: .NET 8+). "
-                ".NET 5+ has full cgroups v2 compatibility since 2020."))
-
-        # Node.js — Node.js 20+ is fully cgroups v2 compatible;
-        # Node.js 22+ has additional memory management improvements
-        m = re.search(r"node[:\-_](\d+)", img)
-        if m:
-            node_major = int(m.group(1))
-            if node_major < 16:
-                report.findings.append(Finding("Node.js Runtime", "HIGH",
-                    f"Node.js {node_major} — no cgroups v2 support",
-                    "Migrate to Node.js 20+ (recommended: Node.js 22+). "
-                    "Memory heap calculation will use host limits, not container limits."))
-            elif node_major < 20:
-                report.findings.append(Finding("Node.js Runtime", "MEDIUM",
-                    f"Node.js {node_major} — limited cgroups v2 support",
-                    "Migrate to Node.js 20+ for full cgroups v2 support. "
-                    "Node.js 22+ recommended for improved container memory management."))
-
-        # Python
-        m = re.search(r"python[:\-_](\d+)\.(\d+)", img)
-        if m and int(m.group(1)) == 2:
-            report.findings.append(Finding("Python Runtime", "MEDIUM",
-                "Python 2 detected — EOL", "Migrate to Python 3.8+."))
-
-        # Go
-        m = re.search(r"golang[:\-_](\d+)\.(\d+)", img)
-        if m and int(m.group(1)) == 1 and int(m.group(2)) < 19:
-            report.findings.append(Finding("Go Runtime", "LOW",
-                f"Go 1.{m.group(2)} — cgroups v2 GOMAXPROCS improved in 1.19+",
-                "Consider Go 1.19+."))
-
-    def _check_known_problematic(self, report: ImageReport, img: str):
-        checks = [
-            (r"mysql[:\-_/](5\.[0-6]|5\.7\.[0-2]\d(?:\D|$))", "Database", "MEDIUM",
-             "Old MySQL — cgroups v2 memory limit issues", "Update to MySQL 8.0+."),
-            (r"postgres(?:ql)?[:\-_/](9\.|10\.|11\.)", "Database", "LOW",
-             "Old PostgreSQL — check base image OS", "Update to PostgreSQL 14+."),
-            (r"elasticsearch[:\-_/](5\.|6\.|7\.[0-9](?:\.|$))", "Search Engine", "HIGH",
-             "Old Elasticsearch — JVM may not support cgroups v2", "Update to Elasticsearch 8.x."),
-            (r"kafka[:\-_/](2\.[0-5]|1\.|0\.)", "Messaging", "MEDIUM",
-             "Old Kafka — internal JVM may not support cgroups v2", "Update to Kafka 3.x+."),
-            (r"jenkins.*(?:jdk8|jdk11(?!\.0\.[2-9]\d))", "CI/CD", "HIGH",
-             "Jenkins with old JDK — memory issues with cgroups v2", "Use Jenkins with JDK 17+."),
-            (r"wildfly[:\-_/](8|9|10|11|12|13|14|15|16)\.", "App Server", "HIGH",
-             "Old WildFly — JVM likely without cgroups v2 support", "Update to WildFly 26+."),
-            (r"tomcat[:\-_/](7\.|8\.0|8\.5\.[0-6]\d(?:\D|$))", "App Server", "MEDIUM",
-             "Old Tomcat — check JDK for cgroups v2 compatibility", "Use Tomcat 10+ with JDK 17+."),
-            # Red Hat middleware — scripts may be cgroups v1-only
-            (r"jboss-eap-7[:\-_/](7\.0|7\.1|7\.2|7\.3)(?:\.|$)", "App Server", "HIGH",
-             "JBoss EAP 7 (old) — init scripts may be cgroups v1-only, causing Xmx miscalculation",
-             "Upgrade to latest JBoss EAP 7.4.x+ or EAP 8. EAP 8 relies on OpenJDK for cgroups detection."),
-            (r"eap-xp[:\-_/][12]\.", "App Server", "MEDIUM",
-             "JBoss EAP XP (old) — check init scripts for cgroups v1 assumptions",
-             "Upgrade to latest EAP XP or EAP 8."),
-            (r"datagrid-8-rhel8|datagrid[:\-_/]8\.([0-2]\.|3\.[0-6])", "Data Grid", "HIGH",
-             "Red Hat Data Grid 8 (pre-8.3.7) — init script is cgroups v1-only, Xmx miscalculated",
-             "Upgrade to Data Grid 8.3.7+ (fixes cgroups v2 Xmx script) or 8.4.6+ (50% heap). "
-             "Pre-8.3.7 defaults to 25% of host memory instead of container memory."),
-            (r"amq-broker[:\-_/](7\.[0-9]|7\.1[01])(?:\.|$)", "Messaging", "MEDIUM",
-             "Old AMQ Broker — check JVM and init scripts for cgroups v2 support",
-             "Upgrade to latest AMQ Broker with JDK 17+."),
-        ]
-        for pattern, cat, sev, msg, rec in checks:
-            if re.search(pattern, img):
-                report.findings.append(Finding(cat, sev, msg, rec))
-
-    # ── Level 2: skopeo remote inspection ───────────────────────────────
-    def _skopeo_inspect_all(self):
-        images = list(self.image_reports.keys())
-        total = len(images)
-
-        images_to_inspect = images
-
-        logger.info(f"Skopeo inspection: {total} images to inspect")
-
-        inspect_total = len(images_to_inspect)
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {executor.submit(self._skopeo_inspect_one, img): img for img in images_to_inspect}
-            done = 0
-            for future in as_completed(futures):
-                done += 1
-                img = futures[future]
-                self._report_progress("skopeo", done, total,
-                    f"Inspecting ({done}/{inspect_total}): {img[:60]}")
-                try:
-                    future.result()
-                except Exception as e:
-                    self.image_reports[img].inspection_error = str(e)
-
-    @staticmethod
-    def _parse_skopeo_error(stderr: str, image: str) -> str:
-        """Extract a meaningful error from skopeo's stderr output.
-
-        Skopeo wraps connection/auth errors inside 'Error parsing image name',
-        hiding the real cause.  This method extracts the actual reason.
+        Primary detection is via pod exec. Skopeo is used as fallback for
+        images where exec failed (optional, behind skopeo_fallback flag).
         """
-        stderr = stderr.strip()
-        # skopeo structured log: extract msg="..." content
-        msg_match = re.search(r'msg="(.+)"?\s*$', stderr, re.DOTALL)
-        inner = msg_match.group(1).rstrip('"') if msg_match else stderr
+        # Primary: exec-based inspection for all images with running pods
+        self._exec_inspect_all()
 
-        # Known real-cause patterns (ordered by specificity)
-        patterns = [
-            (r"unauthorized", "unauthorized – registry credentials required"),
-            (r"authentication required", "authentication required"),
-            (r"no such host", "registry host not found (DNS)"),
-            (r"connection refused", "registry connection refused"),
-            (r"certificate.+unknown authority", "TLS certificate not trusted"),
-            (r"manifest unknown", "manifest not found in registry"),
-            (r"timeout", "registry connection timeout"),
-            (r"no basic auth credentials", "no auth credentials provided"),
-        ]
-        for pat, friendly in patterns:
-            if re.search(pat, inner, re.IGNORECASE):
-                return f"skopeo: {friendly}"
+        # Optional fallback: skopeo for images where exec failed
+        if self.skopeo_fallback:
+            failed_images = [
+                img for img, r in self.image_reports.items()
+                if not r.inspected and not r.only_in_init
+            ]
+            if failed_images and self._check_skopeo():
+                self._skopeo_inspect_all(failed_images)
 
-        # Fallback: return full stderr (up to 500 chars)
-        return f"skopeo failed: {stderr[:500]}"
 
-    def _skopeo_inspect_one(self, image: str):
-        report = self.image_reports[image]
-        cmd = ["skopeo", "inspect"]
-        tmp_auth_file = None
-
-        is_internal = bool(self._internal_registry and self._internal_registry in image)
-
-        # Internal registry always needs --tls-verify=false (self-signed certs)
-        if not self.skopeo_tls_verify or is_internal:
-            cmd.append("--tls-verify=false")
-
-        # Auth selection:
-        # - For the OpenShift internal registry, always use the scanner's own
-        #   ServiceAccount token (granted system:image-puller cluster-wide).
-        #   We must NOT pass --authfile here, because pull-secret tokens
-        #   harvested from pods are SA tokens scoped to a single namespace,
-        #   which would shadow our cluster-wide token and cause
-        #   "authentication required" for imagestreams in other namespaces.
-        # - For external registries, use (in order): explicit global authfile,
-        #   then a temp authfile built from ImagePullSecrets / saved registry
-        #   credentials.
-        if is_internal and self._sa_token:
-            cmd.extend(["--creds", f"serviceaccount:{self._sa_token}"])
-        elif self.skopeo_auth_file:
-            cmd.extend(["--authfile", self.skopeo_auth_file])
-        elif self._registry_auths:
-            tmp_auth_file = self._build_auth_file_for_image(image)
-            if tmp_auth_file:
-                cmd.extend(["--authfile", tmp_auth_file])
-
-        # Normalize image reference for skopeo.
-        # Images with both tag and digest (e.g. image:v4.18@sha256:abc) cause
-        # "Error parsing image name" because skopeo cannot handle that format.
-        # Strip the tag portion, keeping only the digest which is the precise ref.
-        skopeo_ref = image
-        if "@sha256:" in skopeo_ref:
-            # Split at @, then remove the tag from the name part (before @)
-            name_part, digest_part = skopeo_ref.split("@", 1)
-            # name_part might be "registry:5000/repo:tag" — strip only the TAG,
-            # not the registry port.  The tag is always after the last '/'.
-            last_slash = name_part.rfind("/")
-            if last_slash >= 0:
-                repo_part = name_part[last_slash + 1:]
-                if ":" in repo_part:
-                    # Strip the tag from the final path segment
-                    name_part = name_part[:last_slash + 1] + repo_part.rsplit(":", 1)[0]
-            else:
-                # No slash at all (e.g. "image:tag@sha256:...")
-                if ":" in name_part:
-                    name_part = name_part.rsplit(":", 1)[0]
-            skopeo_ref = f"{name_part}@{digest_part}"
-        cmd.append(f"docker://{skopeo_ref}")
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            if result.returncode != 0:
-                report.inspection_error = self._parse_skopeo_error(result.stderr, image)
-                return
-            data = json.loads(result.stdout)
-        except subprocess.TimeoutExpired:
-            report.inspection_error = "skopeo timeout"
-            return
-        except json.JSONDecodeError:
-            report.inspection_error = "invalid JSON from skopeo"
-            return
-        finally:
-            # Clean up temporary auth file
-            if tmp_auth_file:
-                try:
-                    os.unlink(tmp_auth_file)
-                except OSError:
-                    pass
-
-        report.inspected = True
-        self._analyze_skopeo_data(report, data)
-
-    def _analyze_skopeo_data(self, report: ImageReport, data: dict):
-        labels = data.get("Labels") or {}
-        env_list = data.get("Env") or []
-        cmd = data.get("Cmd") or []
-        entrypoint = data.get("Entrypoint") or []
-
-        metadata = self._build_inspection_metadata(labels, env_list, cmd, entrypoint)
-        report.inspection_metadata = metadata
-
-        # Base image from OCI labels
-        base_image = (
-            labels.get("org.opencontainers.image.base.name", "")
-            or labels.get("base-image", "")
-            or labels.get("io.openshift.build.image", "")
-        )
-        if base_image:
-            for pattern, (name, sev, rec) in KNOWN_PROBLEMATIC_BASES.items():
-                if re.search(pattern, base_image.lower()):
-                    existing = [f for f in report.findings
-                                if f.category.startswith("Base Image") and name in f.message]
-                    if not existing:
-                        report.findings.append(Finding("Base Image (skopeo)", sev,
-                            f"Real base image: {name} (OCI label)", rec,
-                            f"Label: {base_image}"))
-
-        # Red Hat component label
-        rh_comp = labels.get("com.redhat.component", "")
-        if rh_comp and ("el7" in rh_comp.lower() or "rhel-7" in rh_comp.lower()):
-            if not any("RHEL" in f.message and "7" in f.message for f in report.findings):
-                report.findings.append(Finding("Base Image (skopeo)", "CRITICAL",
-                    "Red Hat component based on RHEL 7 detected via label",
-                    "Migrate to UBI 8/9.",
-                    f"Label: {rh_comp}"))
-
-        # Red Hat middleware detection via labels
-        self._check_middleware_labels(report, labels)
-
-        # ENV / CMD / Entrypoint cgroups v1 references
-        all_text = " ".join(str(x) for x in entrypoint + cmd + env_list)
-        for v1_path in CGROUPS_V1_PATHS:
-            if v1_path in all_text:
-                report.findings.append(Finding("cgroups v1 Reference (skopeo)", "HIGH",
-                    f"cgroups v1 path reference in image config: {v1_path}",
-                    "Update application to use cgroups v2 unified hierarchy."))
-                break
-        for v1_file in CGROUPS_V1_FILES:
-            if v1_file in all_text:
-                report.findings.append(Finding("cgroups v1 Reference (skopeo)", "HIGH",
-                    f"cgroups v1 file reference in image config: {v1_file}",
-                    "This file does not exist in cgroups v2. Check v1→v2 mapping."))
-                break
-
-        # JVM flags
-        for env_var in env_list:
-            if isinstance(env_var, str):
-                if "-UseContainerSupport" in env_var and ":-UseContainerSupport" in env_var:
-                    report.findings.append(Finding("JVM Config (skopeo)", "HIGH",
-                        "-XX:-UseContainerSupport disables container detection",
-                        "Remove this flag. JVM needs it enabled for cgroups v2."))
-                jm = re.match(r"JAVA_VERSION=(.+)", env_var)
-                if jm:
-                    self._check_java_env(report, jm.group(1))
-
-        if not report.findings and not metadata.get("has_base_image_label") and not metadata.get("has_os_labels"):
-            report.inspection_metadata["insufficient_labels"] = True
-
-    @staticmethod
-    def _build_inspection_metadata(labels: dict, env_list: list,
-                                   cmd: list, entrypoint: list) -> dict:
-        """Summarize what skopeo returned for audit trail purposes."""
-        # Collect relevant label keys that help identify base image / OS
-        os_label_keys = {
-            "org.opencontainers.image.base.name", "base-image",
-            "io.openshift.build.image", "com.redhat.component",
-            "org.opencontainers.image.version", "version",
-            "release", "name", "summary", "description",
-            "org.opencontainers.image.title",
-        }
-        found_labels = {k: v for k, v in labels.items() if k in os_label_keys and v}
-
-        base_label = (
-            labels.get("org.opencontainers.image.base.name", "")
-            or labels.get("base-image", "")
-            or labels.get("io.openshift.build.image", "")
-        )
-
-        has_os_labels = bool(
-            labels.get("com.redhat.component")
-            or labels.get("org.opencontainers.image.base.name")
-            or labels.get("base-image")
-            or labels.get("release")
-        )
-
-        env_relevant = []
-        for e in env_list:
-            if isinstance(e, str):
-                key = e.split("=", 1)[0] if "=" in e else e
-                if key in ("JAVA_VERSION", "JAVA_HOME", "NODE_VERSION",
-                           "PYTHON_VERSION", "DOTNET_VERSION", "GOLANG_VERSION",
-                           "PATH", "HOME"):
-                    env_relevant.append(e)
-
-        metadata = {
-            "label_count": len(labels),
-            "env_count": len(env_list),
-            "has_base_image_label": bool(base_label),
-            "has_os_labels": has_os_labels,
-            "relevant_labels": found_labels if found_labels else None,
-            "relevant_env": env_relevant if env_relevant else None,
-            "has_cmd": bool(cmd),
-            "has_entrypoint": bool(entrypoint),
-        }
-        return {k: v for k, v in metadata.items() if v is not None}
-
-    def _check_java_env(self, report: ImageReport, ver_str: str):
-        ver = ver_str.strip()
-
-        # Old-style with update: 1.8.0_412, 1.7.0_80
-        m_old_full = re.match(r"1\.(\d+)\.0[_\-](\d+)", ver)
-        # Old-style without update: 1.8.0 (common in Red Hat base images)
-        m_old_short = re.match(r"1\.(\d+)\.0$", ver)
-        # New-style: 11.0.16, 17, 21.0.1
-        m_new = re.match(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", ver)
-
-        major = minor = patch = 0
-        has_update = True
-
-        if m_old_full:
-            major, patch = int(m_old_full.group(1)), int(m_old_full.group(2))
-        elif m_old_short:
-            # "1.8.0" → Java 8, but update version unknown
-            major = int(m_old_short.group(1))
-            has_update = False
-        elif m_new:
-            major = int(m_new.group(1))
-            minor = int(m_new.group(2) or 0)
-            patch = int(m_new.group(3) or 0)
-
-        if major == 0:
-            return
-
-        safe = (major >= 15 or
-                (major == 11 and (minor > 0 or patch >= 16)) or
-                (major == 8 and patch >= 372))
-
-        if safe:
-            return
-
-        if not any(f.category == "Java Runtime (skopeo)" for f in report.findings):
-            # Java 8 without update version (e.g. JAVA_VERSION=1.8.0):
-            # Red Hat OpenJDK 8u372+ has cgroups v2 support backported.
-            # Flag for targeted `java -version` exec to resolve the real version.
-            if major == 8 and not has_update:
-                self._java_version_unresolved.add(report.image)
-                return
-            sev = "HIGH" if major < 11 else "MEDIUM"
-            report.findings.append(Finding("Java Runtime (skopeo)", sev,
-                f"Java {ver} via JAVA_VERSION ENV — may not support cgroups v2",
-                f"Safe versions: {JAVA_SAFE_VERSIONS}",
-                f"ENV JAVA_VERSION={ver}"))
-
-    def _check_middleware_labels(self, report: ImageReport, labels: dict):
-        """Detect Red Hat middleware products via OCI/Red Hat labels.
-
-        JBoss EAP 7, Data Grid 8 (pre-8.3.7), and other middleware may use
-        init scripts that are cgroups v1-only for Xmx calculation.
-        """
-        rh_comp = labels.get("com.redhat.component", "").lower()
-        version_label = (
-            labels.get("version", "")
-            or labels.get("org.opencontainers.image.version", "")
-        )
-        name_label = labels.get("name", "").lower()
-        summary_label = labels.get("summary", "").lower()
-
-        # JBoss EAP detection
-        if "eap" in rh_comp or "jboss-eap" in name_label or "eap" in summary_label:
-            # Old EAP 7 images had cgroups v1-only memory scripts
-            if re.search(r"7\.[0-3]", version_label):
-                if not any("EAP" in f.message for f in report.findings):
-                    report.findings.append(Finding("Middleware (skopeo)", "HIGH",
-                        f"JBoss EAP {version_label} — init scripts may be cgroups v1-only",
-                        "Upgrade to latest JBoss EAP 7.4.x+ or EAP 8. "
-                        "EAP 8 fully relies on OpenJDK layer for cgroups detection.",
-                        f"Label: com.redhat.component={rh_comp}"))
-
-        # Red Hat Data Grid detection
-        if "datagrid" in rh_comp or "infinispan" in name_label or "data grid" in summary_label:
-            m = re.match(r"(\d+)\.(\d+)\.?(\d*)", version_label)
-            if m:
-                dg_major, dg_minor, dg_patch = (
-                    int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
-                )
-                # Data Grid 8.3.x before 8.3.7 has cgroups v1-only Xmx script
-                if dg_major == 8 and (dg_minor < 3 or (dg_minor == 3 and dg_patch < 7)):
-                    if not any("Data Grid" in f.message for f in report.findings):
-                        report.findings.append(Finding("Middleware (skopeo)", "HIGH",
-                            f"Red Hat Data Grid {version_label} — Xmx script is cgroups v1-only",
-                            "Upgrade to Data Grid 8.3.7+ or 8.4.6+. "
-                            "Pre-8.3.7 uses host memory for Xmx calculation, not container memory.",
-                            f"Label: com.redhat.component={rh_comp}"))
-                # DG 8.3.7+ works but uses 25% instead of intended 50%
-                elif dg_major == 8 and dg_minor == 3 and dg_patch >= 7:
-                    report.findings.append(Finding("Middleware (skopeo)", "LOW",
-                        f"Red Hat Data Grid {version_label} — heap defaults to 25% of container",
-                        "Data Grid 8.3.7+ is cgroups v2 compatible but uses 25% heap "
-                        "(upstream default). Upgrade to 8.4.6+ for 50% heap, or set "
-                        "MaxRAMPercentage explicitly.",
-                        f"Label: com.redhat.component={rh_comp}"))
 
     # ─────────────────────────────────────────────────────────────────────
-    # Java version verification via pod exec
+    # Primary: exec-based inspection
     # ─────────────────────────────────────────────────────────────────────
-    def _verify_java_versions(self):
-        """Run `java -version` inside pods to resolve ambiguous Java versions.
+    def _exec_inspect_all(self):
+        """Execute inspection script inside running pods.
 
-        When JAVA_VERSION env var lacks the update suffix (e.g. "1.8.0" instead
-        of "1.8.0_412"), we can't determine cgroups v2 compatibility from metadata
-        alone. This method execs into running pods to get the real version.
-
-        Runs automatically (independent of --exec-check flag) because the
-        alternative is a false positive.
+        Picks one running pod per unique image and runs the comprehensive
+        detection script that checks OS, runtimes, and cgroups v1 usage.
         """
-        targets = {
-            img: self._image_pod_map[img]
-            for img in self._java_version_unresolved
-            if img in self._image_pod_map
+        exec_targets = {
+            img: pod_info
+            for img, pod_info in self._image_pod_map.items()
+            if img in self.image_reports
         }
 
-        if not targets:
-            # No running pods available for verification — add fallback findings
-            for img in self._java_version_unresolved:
-                if img in self.image_reports:
-                    report = self.image_reports[img]
-                    if not any(f.category.startswith("Java Runtime") for f in report.findings):
-                        report.findings.append(Finding("Java Runtime (skopeo)", "MEDIUM",
-                            "Java 8 detected (JAVA_VERSION env) — could not verify update version",
-                            f"No running pod available to exec 'java -version'. "
-                            f"Safe versions: {JAVA_SAFE_VERSIONS}",
-                            "JAVA_VERSION lacks update suffix and pod exec was not possible"))
+        if not exec_targets:
+            logger.info("Exec inspection: no running pods available")
             return
 
-        total = len(targets)
-        # Track exec errors per image for detailed fallback messages
-        exec_errors: Dict[str, str] = {}
-        not_in_pod_map = self._java_version_unresolved - targets.keys()
-        logger.info(f"Java version verification: {total} images to check via pod exec"
-                     f" ({len(not_in_pod_map)} without running pods)")
+        total = len(exec_targets)
+        logger.info(f"Exec inspection: {total} images to inspect "
+                     f"({_EXEC_MAX_WORKERS} workers, {_EXEC_TIMEOUT}s timeout)")
 
-        with ThreadPoolExecutor(max_workers=min(total, _EXEC_MAX_WORKERS)) as executor:
+        with ThreadPoolExecutor(max_workers=_EXEC_MAX_WORKERS) as executor:
             futures = {
-                executor.submit(self._verify_java_version_one, img, ns, pod, container): img
-                for img, (ns, pod, container) in targets.items()
+                executor.submit(self._exec_inspect_one, img, ns, pod_name, container):
+                img for img, (ns, pod_name, container) in exec_targets.items()
             }
             done = 0
             for future in as_completed(futures):
                 done += 1
                 img = futures[future]
-                self._report_progress("java_verify", done, total,
-                    f"Verifying Java ({done}/{total}): {img[:60]}")
+                self._report_progress("inspecting", done, total,
+                    f"Inspecting ({done}/{total}): {img[:60]}")
                 try:
-                    err = future.result()
-                    if err:
-                        exec_errors[img] = err
+                    future.result()
                 except Exception as e:
-                    exec_errors[img] = str(e)
+                    logger.debug(f"Exec inspection failed for {img}: {e}")
 
-        resolved = total - len(self._java_version_unresolved & targets.keys())
-        failed = len(self._java_version_unresolved & targets.keys())
-        logger.info(f"Java version verification: {resolved} resolved, {failed} failed")
-        if exec_errors:
-            first_err = next(iter(exec_errors.values()))
-            logger.warning(f"Java version exec errors ({len(exec_errors)} images): {first_err}")
+        inspected = sum(1 for r in self.image_reports.values() if r.inspected)
+        with_findings = sum(1 for r in self.image_reports.values() if r.findings)
+        self.cluster_info["exec_inspected"] = str(inspected)
+        logger.info(f"Exec inspection: {inspected}/{total} inspected, {with_findings} with findings")
 
-        # Fallback for images where exec failed or no pod available
-        for img in list(self._java_version_unresolved):
-            if img not in self.image_reports:
-                continue
-            report = self.image_reports[img]
-            if any(f.category.startswith("Java Runtime") for f in report.findings):
-                continue
-
-            if img in not_in_pod_map:
-                reason = "no running pod available for exec"
-            elif img in exec_errors:
-                reason = f"exec error: {exec_errors[img]}"
-            else:
-                reason = "java -version returned no parseable output"
-
-            report.findings.append(Finding("Java Runtime (skopeo)", "MEDIUM",
-                "Java 8 detected (JAVA_VERSION env) — could not verify update version",
-                f"Safe versions: {JAVA_SAFE_VERSIONS}",
-                f"JAVA_VERSION lacks update suffix. Exec verification failed: {reason}"))
-
-    def _verify_java_version_one(self, image: str, namespace: str,
-                                pod_name: str, container: str) -> Optional[str]:
-        """Exec `java -version` inside a pod and resolve the finding.
-
-        Returns None on success, or an error string on failure.
-        """
+    def _exec_inspect_one(self, image: str, namespace: str, pod_name: str, container: str):
+        """Execute the inspection script inside a single pod container."""
         report = self.image_reports[image]
         pod_ref = f"{namespace}/{pod_name}:{container}"
 
@@ -1276,145 +697,80 @@ class CGroupsV2Scanner:
                 self.v1.connect_get_namespaced_pod_exec,
                 pod_name, namespace,
                 container=container,
-                command=["/bin/sh", "-c", "java -version 2>&1"],
+                command=["/bin/sh", "-c", _EXEC_INSPECT_SCRIPT],
                 stderr=True, stdin=False, stdout=True, tty=False,
                 _request_timeout=_EXEC_TIMEOUT,
             )
         except ApiException as e:
-            reason = f"HTTP {e.status}: {e.reason}" if hasattr(e, 'status') else str(e)
-            logger.warning(f"Java version exec rejected for {pod_ref}: {reason}")
-            return reason
-        except Exception as e:
-            logger.warning(f"Java version exec failed for {pod_ref}: {e}")
-            return str(e)
-
-        if not output:
-            logger.warning(f"Java version exec returned empty output for {pod_ref}")
-            return "exec returned empty output"
-
-        # Parse: openjdk version "1.8.0_412" or java version "17.0.2"
-        m = re.search(r'version "([^"]+)"', output)
-        if not m:
-            logger.warning(f"Could not parse java -version for {pod_ref}: {output[:200]}")
-            return f"unparseable output: {output[:100]}"
-
-        real_version = m.group(1)
-        logger.info(f"Java version verified for {image}: {real_version} (pod {pod_ref})")
-
-        # Parse the real version to determine safety
-        m_old = re.match(r"1\.(\d+)\.0[_\-](\d+)", real_version)
-        m_new = re.match(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", real_version)
-        major = minor = patch = 0
-        if m_old:
-            major, patch = int(m_old.group(1)), int(m_old.group(2))
-        elif m_new:
-            major = int(m_new.group(1))
-            minor = int(m_new.group(2) or 0)
-            patch = int(m_new.group(3) or 0)
-
-        if major == 0:
-            return f"could not parse version number from: {real_version}"
-
-        safe = (major >= 15 or
-                (major == 11 and (minor > 0 or patch >= 16)) or
-                (major == 8 and patch >= 372))
-
-        # Remove from unresolved set — we have a definitive answer
-        self._java_version_unresolved.discard(image)
-
-        if safe:
-            report.inspection_metadata["java_version_verified"] = real_version
-            report.inspection_metadata["java_cgroups_v2_safe"] = True
-            logger.info(f"Java {real_version} is cgroups v2 safe for {image}")
-        else:
-            sev = "HIGH" if major < 11 else "MEDIUM"
-            report.findings.append(Finding("Java Runtime (verified)", sev,
-                f"Java {real_version} confirmed via pod exec — does not support cgroups v2",
-                f"Safe versions: {JAVA_SAFE_VERSIONS}",
-                f"Verified via 'java -version' in pod {pod_ref}"))
-
-        return None
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Level 3: pod exec cgroups v1 runtime detection
-    # ─────────────────────────────────────────────────────────────────────
-    def _exec_check_all(self):
-        """Execute a cgroups v1 detection script inside running pods.
-
-        Picks one running pod per unique image and runs a shell script
-        that checks for cgroups v1 paths, file references, and
-        environment variables inside the container.
-        """
-        # Only check images that have a running pod with a regular container
-        exec_targets = {
-            img: pod_info
-            for img, pod_info in self._image_pod_map.items()
-            if img in self.image_reports
-        }
-
-        if not exec_targets:
-            logger.info("Exec check: no running pods available for exec")
-            return
-
-        total = len(exec_targets)
-        logger.info(f"Exec check: {total} images to inspect via pod exec "
-                     f"({_EXEC_MAX_WORKERS} workers, {_EXEC_TIMEOUT}s timeout)")
-
-        with ThreadPoolExecutor(max_workers=_EXEC_MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(self._exec_check_one, img, ns, pod_name, container):
-                img for img, (ns, pod_name, container) in exec_targets.items()
-            }
-            done = 0
-            for future in as_completed(futures):
-                done += 1
-                img = futures[future]
-                self._report_progress("exec_check", done, total,
-                    f"Pod exec ({done}/{total}): {img[:60]}")
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.debug(f"Exec check failed for {img}: {e}")
-
-        exec_ok = sum(1 for img in exec_targets
-                      if any(f.category.startswith("Runtime Check")
-                             for f in self.image_reports[img].findings))
-        self.cluster_info["exec_checked"] = str(total)
-        logger.info(f"Exec check: completed {total} pods, {exec_ok} with findings")
-
-    def _exec_check_one(self, image: str, namespace: str, pod_name: str, container: str):
-        """Execute the cgroups v1 check script inside a single pod container."""
-        report = self.image_reports[image]
-
-        try:
-            output = k8s_stream(
-                self.v1.connect_get_namespaced_pod_exec,
-                pod_name, namespace,
-                container=container,
-                command=["/bin/sh", "-c", _EXEC_CHECK_SCRIPT],
-                stderr=True, stdin=False, stdout=True, tty=False,
-                _request_timeout=_EXEC_TIMEOUT,
-            )
-        except ApiException as e:
-            if e.status == 403:
-                logger.debug(f"Exec forbidden for {namespace}/{pod_name}: {e.reason}")
-            else:
-                logger.debug(f"Exec failed for {namespace}/{pod_name}: {e}")
+            error = self._clean_exec_error(e)
+            report.inspection_error = error
+            if e.status != 403:
+                logger.debug(f"Exec rejected for {pod_ref}: {error}")
             return
         except Exception as e:
-            logger.debug(f"Exec error for {namespace}/{pod_name}/{container}: {e}")
+            error = self._clean_exec_error(e)
+            report.inspection_error = error
+            logger.debug(f"Exec error for {pod_ref}: {error}")
             return
 
         if not output or "===DONE===" not in output:
-            logger.debug(f"Exec incomplete output for {namespace}/{pod_name}/{container}")
+            report.inspection_error = "exec returned incomplete output (no shell?)"
+            logger.debug(f"Exec incomplete for {pod_ref}")
             return
 
-        report.exec_checked = True
-        self._parse_exec_output(report, output, namespace, pod_name, container)
+        report.inspected = True
+        self._parse_exec_inspection(report, output, namespace, pod_name, container)
 
-    def _parse_exec_output(self, report: ImageReport, output: str,
-                           namespace: str, pod_name: str, container: str):
-        """Parse the output of the cgroups v1 exec check script."""
+    @staticmethod
+    def _clean_exec_error(exc: Exception) -> str:
+        """Extract a meaningful error from exec exceptions.
+
+        The kubernetes client wraps websocket/HTTP errors with verbose
+        headers and response bodies. This extracts just the useful part.
+        """
+        err_str = str(exc)
+
+        if isinstance(exc, ApiException):
+            if hasattr(exc, 'status') and hasattr(exc, 'reason'):
+                if exc.status == 403:
+                    return "exec forbidden (RBAC)"
+                if exc.status == 404:
+                    return "pod no longer running"
+                return f"API error: {exc.status} {exc.reason}"
+
+        # Parse "container not found" from websocket handshake errors
+        m = re.search(r'container not found \("([^"]+)"\)', err_str)
+        if m:
+            return f'container not found ("{m.group(1)}")'
+
+        # Parse "pods not found" from 404 responses
+        m = re.search(r'"pods\s*\\*"([^"\\]+)\\*"\s*not found"', err_str)
+        if m:
+            return "pod no longer running"
+        if "not found" in err_str.lower() and "pod" in err_str.lower():
+            return "pod no longer running"
+
+        # Handshake status errors
+        m = re.search(r'Handshake status (\d+)', err_str)
+        if m:
+            status = m.group(1)
+            if status == "500":
+                return "exec failed (container may not be running)"
+            return f"exec handshake error (HTTP {status})"
+
+        # Timeout
+        if "timed out" in err_str.lower() or "timeout" in err_str.lower():
+            return "exec timeout"
+
+        # Fallback: truncate to something reasonable
+        return err_str[:150] if len(err_str) > 150 else err_str
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Exec output parsing
+    # ─────────────────────────────────────────────────────────────────────
+    def _parse_exec_inspection(self, report: ImageReport, output: str,
+                                namespace: str, pod_name: str, container: str):
+        """Parse the comprehensive exec inspection output."""
         sections = {}
         current_section = None
         current_lines = []
@@ -1434,23 +790,38 @@ class CGroupsV2Scanner:
             sections[current_section] = current_lines
 
         pod_ref = f"{namespace}/{pod_name}:{container}"
+        metadata: Dict = {}
 
-        # Check for v1 file references inside the application
+        # OS detection
+        self._parse_os_info(report, sections.get("OS", []), metadata)
+
+        # Java version
+        self._parse_java_version(report, sections.get("JAVA", []), pod_ref, metadata)
+
+        # JVM flags
+        self._parse_jvm_flags(report, sections.get("JVMFLAGS", []))
+
+        # Node.js version
+        self._parse_node_version(report, sections.get("NODE", []), metadata)
+
+        # .NET version
+        self._parse_dotnet_version(report, sections.get("DOTNET", []), metadata)
+
+        # cgroups v1 file references
         v1_refs = sections.get("V1REFS", [])
         if v1_refs:
-            # Deduplicate file paths
             unique_refs = sorted(set(v1_refs))
             report.findings.append(Finding(
-                "Runtime Check (exec)", "HIGH",
-                f"Application files reference cgroups v1 paths inside the container",
+                "cgroups v1 Reference", "HIGH",
+                "Application files reference cgroups v1 paths inside the container",
                 "Update the application to use cgroups v2 unified hierarchy paths. "
                 "Example: /sys/fs/cgroup/memory.max instead of "
                 "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-                f"Files found in {pod_ref}: {', '.join(unique_refs[:10])}"
+                f"Files in {pod_ref}: {', '.join(unique_refs[:10])}"
                 + (f" (+{len(unique_refs) - 10} more)" if len(unique_refs) > 10 else ""),
             ))
 
-        # Check for cgroups v1 references in environment variables
+        # cgroups v1 in environment variables
         env_refs = sections.get("ENVREF", [])
         cgroup_v1_env = [e for e in env_refs if any(
             v1 in e for v1 in ["/sys/fs/cgroup/memory/", "/sys/fs/cgroup/cpu/",
@@ -1459,44 +830,368 @@ class CGroupsV2Scanner:
         )]
         if cgroup_v1_env:
             report.findings.append(Finding(
-                "Runtime Check (exec)", "MEDIUM",
+                "cgroups v1 Reference", "HIGH",
                 "Environment variables reference cgroups v1 paths",
                 "Update environment variables to use cgroups v2 paths.",
                 f"Pod {pod_ref}: {'; '.join(cgroup_v1_env[:5])}",
             ))
 
+        # Store cgroups type info in metadata
+        cg_type = sections.get("TYPE", [])
+        if cg_type:
+            metadata["cgroups_type"] = cg_type[0]
+
+        v1_dirs = sections.get("V1DIRS", [])
+        if v1_dirs:
+            metadata["v1_dirs_found"] = len(v1_dirs)
+
+        report.inspection_metadata = metadata
+
+    def _parse_os_info(self, report: ImageReport, lines: List[str], metadata: Dict):
+        """Parse /etc/os-release output and detect problematic OS versions."""
+        if not lines or lines == ["unknown"]:
+            return
+
+        os_info = {}
+        for line in lines:
+            if "=" in line:
+                key, val = line.split("=", 1)
+                os_info[key] = val.strip('"')
+
+        os_id = os_info.get("ID", "").lower()
+        version_id = os_info.get("VERSION_ID", "")
+        pretty_name = os_info.get("PRETTY_NAME", "")
+
+        metadata["os_id"] = os_id
+        metadata["os_version"] = version_id
+        if pretty_name:
+            metadata["os_pretty_name"] = pretty_name
+
+        # Check major version only (e.g. "7" from "7.9.2009" or "7")
+        major_version = version_id.split(".")[0] if version_id else ""
+
+        for (check_id, check_ver), (name, sev, rec) in KNOWN_PROBLEMATIC_OS.items():
+            if os_id == check_id and major_version == check_ver:
+                report.findings.append(Finding(
+                    "Operating System", sev,
+                    f"{name} detected — no cgroups v2 support",
+                    rec,
+                    f"OS: {pretty_name or f'{os_id} {version_id}'}",
+                ))
+                return
+
+        # Ubuntu < 20.04
+        if os_id == "ubuntu" and version_id:
+            try:
+                ubuntu_ver = float(version_id)
+                if ubuntu_ver < 20.04:
+                    report.findings.append(Finding(
+                        "Operating System", "HIGH",
+                        f"Ubuntu {version_id} — limited cgroups v2 support",
+                        "Migrate to Ubuntu 20.04+ (Focal) or 22.04+ (Jammy).",
+                        f"OS: {pretty_name or f'Ubuntu {version_id}'}",
+                    ))
+            except ValueError:
+                pass
+
+        # Debian < 11
+        if os_id == "debian" and major_version:
+            try:
+                if int(major_version) < 11:
+                    report.findings.append(Finding(
+                        "Operating System", "HIGH",
+                        f"Debian {version_id} — limited cgroups v2 support",
+                        "Migrate to Debian 11 (Bullseye) or later.",
+                        f"OS: {pretty_name or f'Debian {version_id}'}",
+                    ))
+            except ValueError:
+                pass
+
+        # Alpine < 3.14
+        if os_id == "alpine" and version_id:
+            try:
+                parts = version_id.split(".")
+                alpine_major, alpine_minor = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+                if alpine_major == 3 and alpine_minor < 14:
+                    report.findings.append(Finding(
+                        "Operating System", "HIGH",
+                        f"Alpine {version_id} — requires upgrade for cgroups v2",
+                        "Migrate to Alpine 3.14+.",
+                        f"OS: {pretty_name or f'Alpine {version_id}'}",
+                    ))
+            except (ValueError, IndexError):
+                pass
+
+    def _parse_java_version(self, report: ImageReport, lines: List[str],
+                            pod_ref: str, metadata: Dict):
+        """Parse java -version output and determine cgroups v2 safety."""
+        if not lines or lines == ["NOT_FOUND"]:
+            return
+
+        version_output = "\n".join(lines)
+
+        # Parse: openjdk version "1.8.0_412" or java version "17.0.2"
+        m = re.search(r'version "([^"]+)"', version_output)
+        if not m:
+            metadata["java_detected"] = True
+            metadata["java_parse_error"] = version_output[:100]
+            return
+
+        real_version = m.group(1)
+        metadata["java_version"] = real_version
+
+        # Determine major, minor, patch
+        m_old = re.match(r"1\.(\d+)\.0[_\-](\d+)", real_version)
+        m_new = re.match(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", real_version)
+        major = minor = patch = 0
+
+        if m_old:
+            major, patch = int(m_old.group(1)), int(m_old.group(2))
+        elif m_new:
+            major = int(m_new.group(1))
+            minor = int(m_new.group(2) or 0)
+            patch = int(m_new.group(3) or 0)
+
+        if major == 0:
+            return
+
+        safe = (major >= 15 or
+                (major == 11 and (minor > 0 or patch >= 16)) or
+                (major == 8 and patch >= 372))
+
+        metadata["java_cgroups_v2_safe"] = safe
+
+        if not safe:
+            sev = "CRITICAL" if major < 11 else "HIGH"
+            report.findings.append(Finding(
+                "Java Runtime", sev,
+                f"Java {real_version} — does not support cgroups v2",
+                f"{JAVA_DETAIL} Safe versions: {JAVA_SAFE_VERSIONS}",
+                f"Verified via 'java -version' in pod {pod_ref}",
+            ))
+
+    def _parse_jvm_flags(self, report: ImageReport, lines: List[str]):
+        """Check JVM environment variables for dangerous flags."""
+        if not lines:
+            return
+
+        all_flags = " ".join(lines)
+        if "-UseContainerSupport" in all_flags and ":-UseContainerSupport" in all_flags:
+            report.findings.append(Finding(
+                "JVM Configuration", "HIGH",
+                "-XX:-UseContainerSupport disables container resource detection",
+                "Remove this flag. JVM needs UseContainerSupport enabled for cgroups v2. "
+                "Without it, the JVM uses host memory/CPU limits instead of container limits.",
+            ))
+
+    def _parse_node_version(self, report: ImageReport, lines: List[str], metadata: Dict):
+        """Parse node --version output."""
+        if not lines or lines == ["NOT_FOUND"]:
+            return
+
+        version_str = lines[0].strip().lstrip("v")
+        metadata["node_version"] = version_str
+
+        m = re.match(r"(\d+)", version_str)
+        if not m:
+            return
+
+        node_major = int(m.group(1))
+        if node_major < 16:
+            report.findings.append(Finding(
+                "Node.js Runtime", "HIGH",
+                f"Node.js {version_str} — no cgroups v2 support",
+                "Migrate to Node.js 20+ (recommended: Node.js 22+). "
+                "Memory heap calculation will use host limits, not container limits.",
+            ))
+        elif node_major < 20:
+            report.findings.append(Finding(
+                "Node.js Runtime", "HIGH",
+                f"Node.js {version_str} — limited cgroups v2 support",
+                "Migrate to Node.js 20+ for full cgroups v2 support. "
+                "Node.js 22+ recommended for improved container memory management.",
+            ))
+
+    def _parse_dotnet_version(self, report: ImageReport, lines: List[str], metadata: Dict):
+        """Parse dotnet --list-runtimes output."""
+        if not lines or lines == ["NOT_FOUND"]:
+            return
+
+        # Parse lines like: "Microsoft.NETCore.App 6.0.25 [/usr/share/dotnet/...]"
+        for line in lines:
+            m = re.match(r"Microsoft\.NETCore\.App\s+(\d+)\.(\d+)", line)
+            if m:
+                dotnet_major = int(m.group(1))
+                metadata["dotnet_version"] = f"{m.group(1)}.{m.group(2)}"
+                if dotnet_major < 5:
+                    report.findings.append(Finding(
+                        ".NET Runtime", "HIGH",
+                        f".NET {m.group(1)}.{m.group(2)} — no cgroups v2 support",
+                        "Migrate to .NET 5+ (recommended: .NET 8+). "
+                        ".NET 5+ has full cgroups v2 compatibility since 2020.",
+                    ))
+                return
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Skopeo fallback (optional, for images where exec failed)
+    # ─────────────────────────────────────────────────────────────────────
+    def _check_skopeo(self) -> bool:
+        try:
+            result = subprocess.run(
+                ["skopeo", "--version"], capture_output=True, text=True, timeout=10,
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            logger.warning("skopeo not found — fallback inspection disabled.")
+            return False
+
+    def _skopeo_inspect_all(self, images: List[str]):
+        """Run skopeo inspection on images where exec failed."""
+        total = len(images)
+        logger.info(f"Skopeo fallback: {total} images to inspect")
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(self._skopeo_inspect_one, img): img for img in images}
+            done = 0
+            for future in as_completed(futures):
+                done += 1
+                img = futures[future]
+                self._report_progress("skopeo_fallback", done, total,
+                    f"Skopeo fallback ({done}/{total}): {img[:60]}")
+                try:
+                    future.result()
+                except Exception as e:
+                    self.image_reports[img].inspection_error = str(e)
+
+    @staticmethod
+    def _parse_skopeo_error(stderr: str, image: str) -> str:
+        """Extract a meaningful error from skopeo's stderr output."""
+        stderr = stderr.strip()
+        msg_match = re.search(r'msg="(.+)"?\s*$', stderr, re.DOTALL)
+        inner = msg_match.group(1).rstrip('"') if msg_match else stderr
+
+        patterns = [
+            (r"unauthorized", "unauthorized – registry credentials required"),
+            (r"authentication required", "authentication required"),
+            (r"no such host", "registry host not found (DNS)"),
+            (r"connection refused", "registry connection refused"),
+            (r"certificate.+unknown authority", "TLS certificate not trusted"),
+            (r"manifest unknown", "manifest not found in registry"),
+            (r"timeout", "registry connection timeout"),
+            (r"no basic auth credentials", "no auth credentials provided"),
+            (r"deleted or has expired", "tag deleted or expired in registry"),
+        ]
+        for pat, friendly in patterns:
+            if re.search(pat, inner, re.IGNORECASE):
+                return f"skopeo: {friendly}"
+
+        return f"skopeo failed: {stderr[:500]}"
+
+    def _skopeo_inspect_one(self, image: str):
+        """Inspect a single image via skopeo (fallback)."""
+        report = self.image_reports[image]
+        cmd = ["skopeo", "inspect"]
+        tmp_auth_file = None
+
+        is_internal = bool(self._internal_registry and self._internal_registry in image)
+
+        if not self.skopeo_tls_verify or is_internal:
+            cmd.append("--tls-verify=false")
+
+        if is_internal and self._sa_token:
+            cmd.extend(["--creds", f"serviceaccount:{self._sa_token}"])
+        elif self.skopeo_auth_file:
+            cmd.extend(["--authfile", self.skopeo_auth_file])
+        elif self._registry_auths:
+            tmp_auth_file = self._build_auth_file_for_image(image)
+            if tmp_auth_file:
+                cmd.extend(["--authfile", tmp_auth_file])
+
+        skopeo_ref = image
+        if "@sha256:" in skopeo_ref:
+            name_part, digest_part = skopeo_ref.split("@", 1)
+            last_slash = name_part.rfind("/")
+            if last_slash >= 0:
+                repo_part = name_part[last_slash + 1:]
+                if ":" in repo_part:
+                    name_part = name_part[:last_slash + 1] + repo_part.rsplit(":", 1)[0]
+            else:
+                if ":" in name_part:
+                    name_part = name_part.rsplit(":", 1)[0]
+            skopeo_ref = f"{name_part}@{digest_part}"
+        cmd.append(f"docker://{skopeo_ref}")
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if result.returncode != 0:
+                report.inspection_error = self._parse_skopeo_error(result.stderr, image)
+                return
+            data = json.loads(result.stdout)
+        except subprocess.TimeoutExpired:
+            report.inspection_error = "skopeo timeout"
+            return
+        except json.JSONDecodeError:
+            report.inspection_error = "invalid JSON from skopeo"
+            return
+        finally:
+            if tmp_auth_file:
+                try:
+                    os.unlink(tmp_auth_file)
+                except OSError:
+                    pass
+
+        report.inspected = True
+        self._analyze_skopeo_data(report, data)
+
+    def _analyze_skopeo_data(self, report: ImageReport, data: dict):
+        """Analyze skopeo inspection data (fallback path)."""
+        labels = data.get("Labels") or {}
+        env_list = data.get("Env") or []
+        cmd = data.get("Cmd") or []
+        entrypoint = data.get("Entrypoint") or []
+
+        metadata = {
+            "inspection_method": "skopeo",
+            "label_count": len(labels),
+            "env_count": len(env_list),
+        }
+
+        # Check ENV for JAVA_VERSION
+        for env_var in env_list:
+            if isinstance(env_var, str):
+                jm = re.match(r"JAVA_VERSION=(.+)", env_var)
+                if jm:
+                    ver = jm.group(1).strip()
+                    metadata["java_version_env"] = ver
+
+        # cgroups v1 references in ENV/CMD/Entrypoint
+        all_text = " ".join(str(x) for x in entrypoint + cmd + env_list)
+        for v1_path in CGROUPS_V1_PATHS:
+            if v1_path in all_text:
+                report.findings.append(Finding("cgroups v1 Reference (skopeo)", "HIGH",
+                    f"cgroups v1 path reference in image config: {v1_path}",
+                    "Update application to use cgroups v2 unified hierarchy."))
+                break
+        for v1_file in CGROUPS_V1_FILES:
+            if v1_file in all_text:
+                report.findings.append(Finding("cgroups v1 Reference (skopeo)", "HIGH",
+                    f"cgroups v1 file reference in image config: {v1_file}",
+                    "This file does not exist in cgroups v2. Check v1→v2 mapping."))
+                break
+
+        # JVM flags
+        for env_var in env_list:
+            if isinstance(env_var, str):
+                if "-UseContainerSupport" in env_var and ":-UseContainerSupport" in env_var:
+                    report.findings.append(Finding("JVM Configuration (skopeo)", "HIGH",
+                        "-XX:-UseContainerSupport disables container detection",
+                        "Remove this flag. JVM needs it enabled for cgroups v2."))
+
+        report.inspection_metadata = metadata
+
     # ─────────────────────────────────────────────────────────────────────
     # Report generation
     # ─────────────────────────────────────────────────────────────────────
-    def _apply_init_container_severity_downgrade(self):
-        """Downgrade finding severity for images that appear ONLY in initContainers.
-
-        InitContainers run once and exit before the main containers start.
-        A legacy busybox or alpine used only as initContainer (e.g., for chown/chmod)
-        is less risky than the same image running as a long-lived container.
-        Severity is reduced by one level and a note is added.
-        """
-        severity_downgrade = {
-            "CRITICAL": "HIGH",
-            "HIGH": "MEDIUM",
-            "MEDIUM": "LOW",
-            "LOW": "INFO",
-        }
-        for report in self.image_reports.values():
-            if not report.only_in_init:
-                continue
-            for finding in report.findings:
-                original = finding.severity
-                downgraded = severity_downgrade.get(original)
-                if downgraded:
-                    finding.severity = downgraded
-                    finding.message = f"[initContainer only] {finding.message}"
-                    finding.details = (
-                        f"{finding.details} "
-                        f"(severity reduced from {original} to {downgraded} "
-                        f"because this image is only used in initContainers)"
-                    ).strip()
-
     def get_summary(self) -> dict:
         """Return scan summary as a dictionary."""
         by_severity = defaultdict(int)
@@ -1504,19 +1199,19 @@ class CGroupsV2Scanner:
             by_severity[r.max_severity] += 1
 
         init_only = sum(1 for r in self.image_reports.values() if r.only_in_init)
+        inspected = sum(1 for r in self.image_reports.values() if r.inspected)
+        inspection_errors = sum(1 for r in self.image_reports.values() if r.inspection_error)
 
         summary = {
             "generated_at": datetime.now().isoformat(),
             "cluster_info": self.cluster_info,
             "total_images": len(self.image_reports),
             "init_only_images": init_only,
-            "inspected_via_skopeo": sum(1 for r in self.image_reports.values() if r.inspected),
-            "skopeo_errors": sum(1 for r in self.image_reports.values() if r.inspection_error),
-            "exec_checked": int(self.cluster_info.get("exec_checked", 0)),
+            "inspected": inspected,
+            "inspection_errors": inspection_errors,
             "by_severity": dict(by_severity),
         }
 
-        # Add OCP cgroups context based on detected cluster version
         ocp_ver = self.cluster_info.get("openshift_version", "")
         summary["cgroups_context"] = self._get_cgroups_context(ocp_ver)
 
@@ -1524,11 +1219,7 @@ class CGroupsV2Scanner:
 
     @staticmethod
     def _get_cgroups_context(ocp_version: str) -> dict:
-        """Provide cgroups v1/v2 context based on the detected OCP version.
-
-        Based on: developers.redhat.com/articles/2025/11/27/
-        how-does-cgroups-v2-impact-java-net-and-nodejs-openshift-4
-        """
+        """Provide cgroups v1/v2 context based on the detected OCP version."""
         ctx = {"version": ocp_version, "risk_level": "unknown", "detail": ""}
         if not ocp_version or ocp_version.startswith("N/A"):
             ctx["detail"] = "Could not detect OpenShift version."

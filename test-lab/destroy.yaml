@@ -1,0 +1,38 @@
+---
+- name: Destroy cgroups v2 checker test lab
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/lab.yaml
+
+  tasks:
+    - name: Delete lab namespaces
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: "{{ lab_prefix }}-{{ item.name }}"
+      loop: "{{ namespaces }}"
+      loop_control:
+        label: "{{ lab_prefix }}-{{ item.name }}"
+
+    - name: Wait for namespace deletion
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: v1
+        kind: Namespace
+        name: "{{ lab_prefix }}-{{ item.name }}"
+      register: ns_check
+      until: ns_check.resources | length == 0
+      retries: 60
+      delay: 5
+      loop: "{{ namespaces }}"
+      loop_control:
+        label: "{{ lab_prefix }}-{{ item.name }}"
+
+    - name: Cleanup complete
+      ansible.builtin.debug:
+        msg: "All {{ namespaces | length }} lab namespaces ({{ lab_prefix }}-*) deleted."

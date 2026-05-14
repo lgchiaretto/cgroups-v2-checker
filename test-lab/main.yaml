@@ -1,0 +1,95 @@
+---
+- name: Create cgroups v2 checker test lab
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/lab.yaml
+
+  tasks:
+    - name: Verify cluster is reachable
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: config.openshift.io/v1
+        kind: ClusterVersion
+        name: version
+      register: cluster_version
+
+    - name: Show cluster version
+      ansible.builtin.debug:
+        msg: "Connected to OpenShift {{ cluster_version.resources[0].status.desired.version }}"
+
+    - name: Create namespaces
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ lab_prefix }}-{{ item.name }}"
+            labels:
+              lab: "{{ lab_prefix }}"
+      loop: "{{ namespaces }}"
+      loop_control:
+        label: "{{ lab_prefix }}-{{ item.name }}"
+
+    - name: Deploy standard containers
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition: "{{ lookup('ansible.builtin.template', 'templates/deployment.yaml.j2') }}"
+      vars:
+        ns_name: "{{ lab_prefix }}-{{ item.0.name }}"
+        deploy: "{{ item.1 }}"
+      loop: "{{ namespaces | subelements('deployments') }}"
+      loop_control:
+        label: "{{ lab_prefix }}-{{ item.0.name }}/{{ item.1.name }}"
+      when: item.1.type is not defined
+
+    - name: Deploy multi-container and initContainer workloads
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig }}"
+        state: present
+        definition: "{{ lookup('ansible.builtin.template', 'templates/deployment-multi.yaml.j2') }}"
+      vars:
+        ns_name: "{{ lab_prefix }}-{{ item.0.name }}"
+        deploy: "{{ item.1 }}"
+      loop: "{{ namespaces | subelements('deployments') }}"
+      loop_control:
+        label: "{{ lab_prefix }}-{{ item.0.name }}/{{ item.1.name }}"
+      when: item.1.type is defined
+
+    - name: Wait for deployments
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ lab_prefix }}-{{ item.0.name }}"
+        name: "{{ item.1.name }}"
+      register: deploy_status
+      until:
+        - deploy_status.resources | length > 0
+        - deploy_status.resources[0].status.availableReplicas | default(0) >= (item.1.replicas | default(1))
+      retries: 60
+      delay: 5
+      loop: "{{ namespaces | subelements('deployments') }}"
+      loop_control:
+        label: "{{ lab_prefix }}-{{ item.0.name }}/{{ item.1.name }}"
+
+    - name: Lab summary
+      ansible.builtin.debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════╗
+          ║  cgroups v2 Checker — Test Lab Ready                       ║
+          ╠══════════════════════════════════════════════════════════════╣
+          {% for ns in namespaces %}
+          ║  {{ lab_prefix }}-{{ ns.name }}:
+          {% for d in ns.deployments %}
+          ║    {{ '%-25s' | format(d.name) }} ×{{ d.replicas | default(1) }} → {{ d.expected | default('') }}
+          {% endfor %}
+          {% endfor %}
+          ╠══════════════════════════════════════════════════════════════╣
+          ║  Total: ~{{ namespaces | map(attribute='deployments') | flatten | map(attribute='replicas', default=1) | map('int') | sum }} pods across {{ namespaces | length }} namespaces              ║
+          ╚══════════════════════════════════════════════════════════════╝

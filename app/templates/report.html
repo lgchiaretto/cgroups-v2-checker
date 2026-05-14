@@ -2,7 +2,7 @@
 {% block title %}Report {{ report_id }} - cgroups v2 Checker{% endblock %}
 
 {% block content %}
-{% set sev_colors = {"CRITICAL": "red", "HIGH": "orange", "MEDIUM": "gold", "LOW": "blue", "UNKNOWN": "purple", "OK": "green"} %}
+{% set sev_colors = {"CRITICAL": "red", "HIGH": "orange", "UNKNOWN": "purple", "OK": "green"} %}
 
 <!-- Header -->
 <div class="pf-v6-l-flex pf-m-justify-content-space-between pf-m-align-items-center pf-v6-u-mb-lg">
@@ -36,25 +36,26 @@
         <div class="pf-v6-u-color-200">Total images</div>
       </div>
     </div>
-    <div class="pf-v6-c-card summary-card summary-card--clickable" data-filter-inspected="true" title="Show images inspected via skopeo">
+    <div class="pf-v6-c-card summary-card summary-card--clickable" data-filter-inspected="true" title="Show inspected images">
       <div class="pf-v6-c-card__body">
-        <div class="pf-v6-u-font-size-3xl pf-v6-u-font-weight-bold">{{ report.inspected_via_skopeo }}</div>
+        <div class="pf-v6-u-font-size-3xl pf-v6-u-font-weight-bold">{{ report.inspected|default(report.inspected_via_skopeo|default(0)) }}</div>
         <div class="pf-v6-u-color-200"><i class="fas fa-check-circle pf-v6-u-mr-xs"></i> Inspected</div>
       </div>
     </div>
     <div class="pf-v6-c-card summary-card summary-card--clickable" data-filter-uninspected="true" title="Show images that failed inspection">
       <div class="pf-v6-c-card__body">
         <div class="pf-v6-u-font-size-3xl pf-v6-u-font-weight-bold">
-          {% if report.skopeo_errors|default(0) > 0 %}
-          <span class="pf-v6-c-label pf-m-orange"><span class="pf-v6-c-label__content">{{ report.skopeo_errors }}</span></span>
+          {% set errors = report.inspection_errors|default(report.skopeo_errors|default(0)) %}
+          {% if errors > 0 %}
+          <span class="pf-v6-c-label pf-m-orange"><span class="pf-v6-c-label__content">{{ errors }}</span></span>
           {% else %}
-          {{ report.skopeo_errors|default(0) }}
+          {{ errors }}
           {% endif %}
         </div>
         <div class="pf-v6-u-color-200"><i class="fas fa-exclamation-triangle pf-v6-u-mr-xs"></i> Not Inspected</div>
       </div>
     </div>
-    {% for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN", "OK"] %}
+    {% for sev in ["CRITICAL", "HIGH", "UNKNOWN", "OK"] %}
     {% set count = report.by_severity.get(sev, 0) %}
     <div class="pf-v6-c-card summary-card summary-card--clickable" data-filter-severity="{{ sev }}" title="Filter by {{ sev }}">
       <div class="pf-v6-c-card__body">
@@ -122,7 +123,7 @@
           </div>
         </div>
         <div class="pf-v6-l-flex pf-m-gap-sm" id="severity-filters">
-          {% for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN", "OK"] %}
+          {% for sev in ["CRITICAL", "HIGH", "UNKNOWN", "OK"] %}
           <button class="pf-v6-c-label pf-m-{{ sev_colors[sev] }} severity-filter pf-m-outline"
                   data-severity="{{ sev }}" title="Toggle {{ sev }}">
             <span class="pf-v6-c-label__content">{{ sev }}</span>
@@ -209,7 +210,7 @@
             </td>
             <td role="cell" data-label="Inspected">
               {% if img.inspected %}
-              <i class="fas fa-check-circle pf-v6-u-success-color-100" title="Inspected via skopeo"></i>
+              <i class="fas fa-check-circle pf-v6-u-success-color-100" title="Inspected via pod exec"></i>
               {% elif img.inspection_error %}
               <i class="fas fa-exclamation-triangle pf-v6-u-warning-color-100" title="{{ img.inspection_error }}"></i>
               {% else %}
@@ -222,9 +223,9 @@
             <td colspan="6" style="padding: 0;">
               <div class="pf-v6-u-p-md pf-v6-u-background-color-200">
                 {% for f in img.findings %}
-                <div class="pf-v6-c-alert pf-m-{{ 'danger' if f.severity == 'CRITICAL' else ('warning' if f.severity in ['HIGH', 'MEDIUM'] else 'info') }} pf-m-inline pf-m-plain pf-v6-u-mb-sm">
+                <div class="pf-v6-c-alert pf-m-{{ 'danger' if f.severity == 'CRITICAL' else ('warning' if f.severity == 'HIGH' else 'info') }} pf-m-inline pf-m-plain pf-v6-u-mb-sm">
                   <div class="pf-v6-c-alert__icon">
-                    <i class="fas fa-{% if f.severity == 'CRITICAL' %}exclamation-circle{% elif f.severity in ['HIGH', 'MEDIUM'] %}exclamation-triangle{% else %}info-circle{% endif %}"></i>
+                    <i class="fas fa-{% if f.severity == 'CRITICAL' %}exclamation-circle{% elif f.severity == 'HIGH' %}exclamation-triangle{% else %}info-circle{% endif %}"></i>
                   </div>
                   <h4 class="pf-v6-c-alert__title">
                     <strong>[{{ f.category }}]</strong> {{ f.message }}
@@ -499,9 +500,16 @@ document.addEventListener("DOMContentLoaded", function() {
   function syncCardHighlights() {
     document.querySelectorAll(".summary-card--clickable").forEach(function(card) {
       var sev = card.dataset.filterSeverity;
-      if (activeFilters.size === 0) {
+      var isInspected = card.dataset.filterInspected === "true";
+      var isUninspected = card.dataset.filterUninspected === "true";
+
+      if (isInspected) {
+        card.classList.toggle("summary-card--active", filterInspected);
+      } else if (isUninspected) {
+        card.classList.toggle("summary-card--active", filterUninspected);
+      } else if (activeFilters.size === 0) {
         card.classList.remove("summary-card--active");
-      } else if (sev === "") {
+      } else if (sev === "" || sev === undefined) {
         card.classList.remove("summary-card--active");
       } else {
         card.classList.toggle("summary-card--active", activeFilters.has(sev));
@@ -632,7 +640,7 @@ document.addEventListener("DOMContentLoaded", function() {
   }
 
   function severityColor(sev) {
-    var map = {"CRITICAL": "red", "HIGH": "orange", "MEDIUM": "gold", "LOW": "blue", "OK": "green"};
+    var map = {"CRITICAL": "red", "HIGH": "orange", "UNKNOWN": "purple", "OK": "green"};
     return map[sev] || "blue";
   }
 

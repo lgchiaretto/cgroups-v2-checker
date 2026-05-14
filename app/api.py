@@ -68,8 +68,7 @@ def start_scan():
     exclude_namespaces = body.get("exclude_namespaces")
     namespace_patterns = body.get("namespace_patterns")  # regex patterns for include
     exclude_patterns = body.get("exclude_patterns")  # regex patterns for exclude
-    inspect_images = body.get("inspect_images", True)
-    exec_check = body.get("exec_check", False)
+    skopeo_fallback = body.get("skopeo_fallback", False)
 
     scan_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
 
@@ -94,7 +93,7 @@ def start_scan():
     app = current_app._get_current_object()
     t = threading.Thread(
         target=_run_scan,
-        args=(app, scan_id, namespaces, exclude_namespaces, namespace_patterns, exclude_patterns, inspect_images, exec_check),
+        args=(app, scan_id, namespaces, exclude_namespaces, namespace_patterns, exclude_patterns, skopeo_fallback),
         daemon=True,
     )
     t.start()
@@ -321,7 +320,7 @@ def delete_registry(registry_host: str):
 # ─────────────────────────────────────────────────────────────────────────────
 # Background scan runner
 # ─────────────────────────────────────────────────────────────────────────────
-def _run_scan(app, scan_id, namespaces, exclude_namespaces, namespace_patterns, exclude_patterns, inspect_images, exec_check):
+def _run_scan(app, scan_id, namespaces, exclude_namespaces, namespace_patterns, exclude_patterns, skopeo_fallback):
     """Execute scan in background thread."""
     with app.app_context():
         state = _scans[scan_id]
@@ -341,8 +340,7 @@ def _run_scan(app, scan_id, namespaces, exclude_namespaces, namespace_patterns, 
                 namespace_patterns=namespace_patterns,
                 exclude_patterns=exclude_patterns,
                 skip_system_ns=app.config["SKIP_SYSTEM_NAMESPACES"],
-                inspect_images=inspect_images,
-                exec_check=exec_check,
+                skopeo_fallback=skopeo_fallback,
                 skopeo_tls_verify=app.config["SKOPEO_TLS_VERIFY"],
                 skopeo_auth_file=app.config["SKOPEO_AUTH_FILE"],
                 max_workers=app.config["SKOPEO_MAX_WORKERS"],
