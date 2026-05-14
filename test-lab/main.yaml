@@ -7,7 +7,8 @@
 # Variables injected by run-product.yaml:
 #   cluster_kubeconfig, clustername, cluster_api_url,
 #   cluster_kubeadmin_password, product_name, domain,
-#   provisioner_url, provisioner_token, product_deployment_id
+#   provisioner_url, provisioner_token, product_deployment_id,
+#   _playbook_dir (resolved by run-product.yaml to the playbook directory)
 
 - name: Deploy cgroups v2 Checker test lab
   hosts: localhost
@@ -19,10 +20,11 @@
       {{ (lookup('env', 'TMPDIR') | default('/tmp', true)) ~ '/cgv2-kubeconfig-' ~
       (clustername | default('cluster') | regex_replace('[^a-zA-Z0-9_-]', '-')) }}
 
-  vars_files:
-    - vars/lab.yaml
-
   tasks:
+    - name: Load lab variables
+      ansible.builtin.include_vars:
+        file: "{{ _playbook_dir }}/vars/lab.yaml"
+
     - name: Require cluster kubeconfig
       ansible.builtin.assert:
         that:
@@ -69,7 +71,7 @@
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig_path }}"
         state: present
-        definition: "{{ lookup('ansible.builtin.template', 'templates/deployment.yaml.j2') }}"
+        definition: "{{ lookup('ansible.builtin.template', _playbook_dir ~ '/templates/deployment.yaml.j2') }}"
       vars:
         ns_name: "{{ lab_prefix }}-{{ item.0.name }}"
         deploy: "{{ item.1 }}"
@@ -82,7 +84,7 @@
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig_path }}"
         state: present
-        definition: "{{ lookup('ansible.builtin.template', 'templates/deployment-multi.yaml.j2') }}"
+        definition: "{{ lookup('ansible.builtin.template', _playbook_dir ~ '/templates/deployment-multi.yaml.j2') }}"
       vars:
         ns_name: "{{ lab_prefix }}-{{ item.0.name }}"
         deploy: "{{ item.1 }}"
