@@ -30,13 +30,9 @@
 #
 #   OpenShift Deployment:
 #     --push                 Push image to Quay.io
-#     --deploy               Deploy to OpenShift (apply manifests).
-#                            On first deploy, auto-seeds registry
-#                            credentials from the cluster pull-secret
-#                            (registry.redhat.io, quay.io, etc.).
+#     --deploy               Deploy to OpenShift (apply manifests)
 #     --build-push-deploy    Full pipeline: build, push, deploy, restart
 #     --restart              Restart the OpenShift deployment
-#     --persistent           Persist registry credentials to a K8s Secret
 #     --openshift-status     Show OpenShift resources status
 #     --openshift-logs       Tail OpenShift deployment logs
 #     --remove               Completely remove app from OpenShift
@@ -233,7 +229,6 @@ run_local() {
         -p "${LOCAL_PORT}:8080" \
         -e REPORT_DIR=/app/data/reports \
         -e SKIP_SYSTEM_NAMESPACES=true \
-        -e SKOPEO_TLS_VERIFY=true \
         -v "${SCRIPT_DIR}/data:/app/data:z" \
         "${IMAGE_REF}"
 
@@ -426,105 +421,6 @@ mirror_to_internal() {
     INTERNAL_IMAGE_REF="${svc_image_ref}"
 }
 
-# Auto-populate registry credentials from the cluster's global pull secret.
-# Extracts auths from openshift-config/pull-secret and creates a K8s Secret
-# with registries.json so skopeo can authenticate to registry.redhat.io, quay.io, etc.
-seed_cluster_registries() {
-    local secret_name="${APP_NAME}-registries"
-
-    # Skip if Secret already exists (preserves user-added credentials)
-    if oc get secret "${secret_name}" -n ${NAMESPACE} &>/dev/null; then
-        log_info "Registry credentials Secret already exists — skipping auto-seed"
-        return 0
-    fi
-
-    log_info "Auto-populating registry credentials from cluster pull-secret..."
-
-    local pull_secret_b64
-    pull_secret_b64=$(oc get secret pull-secret -n openshift-config \
-        -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null) || {
-        log_warn "Could not read cluster pull-secret (need cluster-admin). Skipping auto-seed."
-        return 0
-    }
-
-    if [[ -z "$pull_secret_b64" ]]; then
-        log_warn "Cluster pull-secret is empty. Skipping auto-seed."
-        return 0
-    fi
-
-    local reg_file="/tmp/${APP_NAME}-seed-registries.json"
-
-    echo "$pull_secret_b64" | base64 -d | python3 -c "
-import json, sys, base64
-data = json.load(sys.stdin)
-auths = data.get('auths', {})
-# Registries to skip (telemetry/non-image endpoints)
-skip = {'cloud.openshift.com', 'openshift.org'}
-result = []
-for registry, creds in auths.items():
-    if registry in skip:
-        continue
-    auth = creds.get('auth', '')
-    if not auth:
-        continue
-    try:
-        decoded = base64.b64decode(auth).decode()
-        user, passwd = decoded.split(':', 1)
-        result.append({'registry': registry, 'username': user, 'password': passwd})
-    except Exception:
-        continue
-print(json.dumps(result, indent=2))
-" > "${reg_file}" 2>/dev/null
-
-    local count
-    count=$(python3 -c "import json; print(len(json.load(open('${reg_file}'))))" 2>/dev/null || echo "0")
-
-    if [[ "$count" == "0" ]]; then
-        log_warn "No registry credentials found in cluster pull-secret."
-        rm -f "${reg_file}"
-        return 0
-    fi
-
-    log_success "Found ${count} registry credential(s) from cluster pull-secret"
-
-    # Create the Secret
-    oc create secret generic "${secret_name}" \
-        --from-file=registries.json="${reg_file}" \
-        -n ${NAMESPACE} 2>/dev/null || {
-        log_warn "Could not create registry credentials Secret."
-        rm -f "${reg_file}"
-        return 0
-    }
-    rm -f "${reg_file}"
-
-    # Patch deployment to mount the secret
-    oc patch deployment/${APP_NAME} -n ${NAMESPACE} --type=json -p '[
-        {"op": "add", "path": "/spec/template/spec/volumes/-", "value": {
-            "name": "registry-creds",
-            "secret": {"secretName": "'"${secret_name}"'", "optional": true}
-        }},
-        {"op": "add", "path": "/spec/template/spec/containers/0/volumeMounts/-", "value": {
-            "name": "registry-creds",
-            "mountPath": "/app/secrets/registries",
-            "readOnly": true
-        }},
-        {"op": "add", "path": "/spec/template/spec/containers/0/env/-", "value": {
-            "name": "REGISTRIES_FILE",
-            "value": "/app/secrets/registries/registries.json"
-        }}
-    ]' 2>/dev/null || {
-        oc set volume deployment/${APP_NAME} -n ${NAMESPACE} \
-            --add --name=registry-creds \
-            --type=secret --secret-name="${secret_name}" \
-            --mount-path=/app/secrets/registries --read-only \
-            --overwrite 2>/dev/null || true
-        oc set env deployment/${APP_NAME} -n ${NAMESPACE} \
-            REGISTRIES_FILE=/app/secrets/registries/registries.json 2>/dev/null || true
-    }
-
-    log_success "Registry credentials seeded and mounted in deployment"
-}
-
 # Deploy to OpenShift
 deploy_openshift() {
     log_info "Deploying ${APP_NAME} to OpenShift..."
@@ -548,9 +444,6 @@ deploy_openshift() {
 
     log_info "Applying deployment, service, and route..."
     oc apply -f openshift/deployment.yaml
-
-    # Auto-seed registry credentials from cluster pull-secret (first deploy only)
-    seed_cluster_registries
 
     # If mirroring, switch the deployment image to the internal registry
     if [[ "$MIRROR_MODE" == true && -n "$INTERNAL_IMAGE_REF" ]]; then
@@ -667,157 +560,6 @@ openshift_status() {
 openshift_logs() {
     log_info "Showing ${APP_NAME} OpenShift logs (Ctrl+C to exit)..."
     oc logs -n ${NAMESPACE} deployment/${APP_NAME} --tail=100 -f
-}
-
-# Persist registry credentials to a Kubernetes Secret
-persist_registries() {
-    log_info "═══════════════════════════════════════════════════════════════"
-    log_info "  Persist Registry Credentials to Kubernetes Secret"
-    log_info "═══════════════════════════════════════════════════════════════"
-    echo ""
-
-    # Check prerequisites
-    if ! command -v oc &> /dev/null; then
-        log_error "OpenShift CLI (oc) not found."
-        return 1
-    fi
-    if ! oc whoami &> /dev/null; then
-        log_error "Not logged into OpenShift. Please run 'oc login' first."
-        return 1
-    fi
-
-    SECRET_NAME="${APP_NAME}-registries"
-    REG_FILE="/tmp/${APP_NAME}-registries.json"
-
-    # Try to get registries.json from the running pod
-    POD_NAME=$(oc get pods -n ${NAMESPACE} -l app.kubernetes.io/name=${APP_NAME} \
-        --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-
-    if [[ -n "$POD_NAME" ]]; then
-        log_info "Found running pod: ${POD_NAME}"
-        log_info "Extracting registry credentials from pod..."
-
-        if oc exec -n ${NAMESPACE} "${POD_NAME}" -- cat /app/data/registries.json > "${REG_FILE}" 2>/dev/null; then
-            REG_COUNT=$(python3 -c "import json; print(len(json.load(open('${REG_FILE}'))))" 2>/dev/null || echo "0")
-            if [[ "${REG_COUNT}" == "0" || "${REG_COUNT}" == "" ]]; then
-                log_warn "No registry credentials found in the running pod."
-                log_info "Add credentials via the web UI first, then run this command again."
-                rm -f "${REG_FILE}"
-                return 1
-            fi
-            log_success "Found ${REG_COUNT} registry credential(s)"
-        else
-            log_warn "Could not read registries from running pod."
-            log_info "Add credentials via the web UI first, then run this command again."
-            rm -f "${REG_FILE}"
-            return 1
-        fi
-    else
-        log_warn "No running pod found in namespace ${NAMESPACE}."
-        echo ""
-        log_info "Would you like to enter registry credentials manually?"
-        read -p "Enter (y/n): " -r
-        echo
-
-        if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
-            log_info "Skipping --persistent."
-            return 0
-        fi
-
-        # Interactive credential entry
-        REGISTRIES="[]"
-        while true; do
-            echo ""
-            read -p "Registry host (e.g. quay.io): " -r REG_HOST
-            if [[ -z "$REG_HOST" ]]; then break; fi
-            read -p "Username: " -r REG_USER
-            read -sp "Password/Token: " -r REG_PASS
-            echo ""
-
-            if [[ -z "$REG_USER" || -z "$REG_PASS" ]]; then
-                log_warn "Username and password are required. Skipping."
-                continue
-            fi
-
-            # Remove protocol prefix
-            REG_HOST=$(echo "$REG_HOST" | sed 's|https\?://||' | sed 's|/$||')
-
-            REGISTRIES=$(echo "${REGISTRIES}" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-data.append({'registry': '${REG_HOST}', 'username': '${REG_USER}', 'password': '${REG_PASS}'})
-print(json.dumps(data))
-")
-            log_success "Added ${REG_HOST}"
-
-            read -p "Add another registry? (y/n): " -r
-            if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then break; fi
-        done
-
-        REG_COUNT=$(echo "${REGISTRIES}" | python3 -c "import json, sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
-        if [[ "${REG_COUNT}" == "0" ]]; then
-            log_info "No credentials entered. Skipping --persistent."
-            return 0
-        fi
-
-        echo "${REGISTRIES}" > "${REG_FILE}"
-    fi
-
-    # Create or update the Secret
-    log_info "Creating Secret '${SECRET_NAME}' in namespace ${NAMESPACE}..."
-
-    # Delete existing secret if it exists
-    oc delete secret "${SECRET_NAME}" -n ${NAMESPACE} --ignore-not-found 2>/dev/null
-
-    oc create secret generic "${SECRET_NAME}" \
-        --from-file=registries.json="${REG_FILE}" \
-        -n ${NAMESPACE}
-
-    rm -f "${REG_FILE}"
-    log_success "Secret '${SECRET_NAME}' created successfully"
-
-    # Patch deployment to mount the secret
-    log_info "Patching deployment to mount registry credentials..."
-
-    oc patch deployment/${APP_NAME} -n ${NAMESPACE} --type=json -p '[
-        {"op": "add", "path": "/spec/template/spec/volumes/-", "value": {
-            "name": "registry-creds",
-            "secret": {"secretName": "'"${SECRET_NAME}"'", "optional": true}
-        }},
-        {"op": "add", "path": "/spec/template/spec/containers/0/volumeMounts/-", "value": {
-            "name": "registry-creds",
-            "mountPath": "/app/secrets/registries",
-            "readOnly": true
-        }},
-        {"op": "add", "path": "/spec/template/spec/containers/0/env/-", "value": {
-            "name": "REGISTRIES_FILE",
-            "value": "/app/secrets/registries/registries.json"
-        }}
-    ]' 2>/dev/null || {
-        # If patch fails (e.g. volume already exists), try replacing
-        log_warn "Patch failed (volume may already exist). Reapplying deployment..."
-        oc set volume deployment/${APP_NAME} -n ${NAMESPACE} \
-            --add --name=registry-creds \
-            --type=secret --secret-name="${SECRET_NAME}" \
-            --mount-path=/app/secrets/registries --read-only \
-            --overwrite 2>/dev/null || true
-        oc set env deployment/${APP_NAME} -n ${NAMESPACE} \
-            REGISTRIES_FILE=/app/secrets/registries/registries.json 2>/dev/null || true
-    }
-
-    log_info "Restarting deployment to pick up credentials..."
-    oc rollout restart deployment/${APP_NAME} -n ${NAMESPACE}
-    oc rollout status deployment/${APP_NAME} -n ${NAMESPACE}
-
-    echo ""
-    log_success "═══════════════════════════════════════════════════════════════"
-    log_success "  Registry credentials persisted to Secret '${SECRET_NAME}'"
-    log_success "  Credentials will survive pod restarts."
-    log_success "═══════════════════════════════════════════════════════════════"
-    echo ""
-    log_info "To update credentials: modify via web UI, then run '$0 --persistent' again."
-    log_info "To remove persistence: oc delete secret ${SECRET_NAME} -n ${NAMESPACE}"
-    echo ""
 }
 
 # Completely remove application from OpenShift
@@ -953,7 +695,6 @@ run_action() {
         --openshift-status) openshift_status ;;
         --openshift-logs)   openshift_logs ;;
         --remove)           remove_openshift ;;
-        --persistent)       persist_registries ;;
         help)               show_help ;;
         *)
             log_error "Unknown action: $1"

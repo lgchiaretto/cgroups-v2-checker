@@ -38,14 +38,14 @@
     </div>
     <div class="pf-v6-c-card summary-card summary-card--clickable" data-filter-inspected="true" title="Show inspected images">
       <div class="pf-v6-c-card__body">
-        <div class="pf-v6-u-font-size-3xl pf-v6-u-font-weight-bold">{{ report.inspected|default(report.inspected_via_skopeo|default(0)) }}</div>
+        <div class="pf-v6-u-font-size-3xl pf-v6-u-font-weight-bold">{{ report.inspected|default(0) }}</div>
         <div class="pf-v6-u-color-200"><i class="fas fa-check-circle pf-v6-u-mr-xs"></i> Inspected</div>
       </div>
     </div>
     <div class="pf-v6-c-card summary-card summary-card--clickable" data-filter-uninspected="true" title="Show images that failed inspection">
       <div class="pf-v6-c-card__body">
         <div class="pf-v6-u-font-size-3xl pf-v6-u-font-weight-bold">
-          {% set errors = report.inspection_errors|default(report.skopeo_errors|default(0)) %}
+          {% set errors = report.inspection_errors|default(0) %}
           {% if errors > 0 %}
           <span class="pf-v6-c-label pf-m-orange"><span class="pf-v6-c-label__content">{{ errors }}</span></span>
           {% else %}

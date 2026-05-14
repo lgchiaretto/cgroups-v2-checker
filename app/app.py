@@ -24,12 +24,8 @@ def create_app(config_class=None):
     from app.routes import web_bp
     app.register_blueprint(web_bp)
 
-    from app.api import api_bp, init_registries
+    from app.api import api_bp
     app.register_blueprint(api_bp, url_prefix="/api")
-
-    # Load persisted registry credentials from disk
-    with app.app_context():
-        init_registries()
 
     # Cache-Control for static files
     @app.after_request

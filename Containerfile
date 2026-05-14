@@ -2,9 +2,6 @@
 # hadolint ignore=DL3007
 FROM registry.access.redhat.com/ubi9/python-312:latest
 
-# Setting to SemVer with no breaking changes in between
-ARG SKOPEO_VER="2:1.20.*"
-
 LABEL name="cgroups-v2-checker" \
       summary="OpenShift cgroups v2 Compatibility Checker" \
       description="Web application that scans OpenShift clusters for container images with cgroups v2 compatibility issues before upgrading to OCP 4.19." \
@@ -22,14 +19,6 @@ RUN if [ -s /tmp/.build-ca.pem ]; then \
       update-ca-trust && \
       echo "Custom CA certificate installed"; \
     fi && rm -f /tmp/.build-ca.pem
-
-# Install skopeo (required for remote image inspection)
-# Ignoring due to known issue https://github.com/hadolint/hadolint/issues/1136 with Hadolint v2.14.0
-# hadolint ignore=DL3041
-RUN dnf install --nodocs --assumeyes \
-      "skopeo-${SKOPEO_VER}" && \
-    dnf clean all && \
-    rm -rf /var/cache/dnf
 
 # Create app directories
 RUN mkdir -p /app/data/reports && \

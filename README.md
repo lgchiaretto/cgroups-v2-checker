@@ -18,7 +18,6 @@ This tool helps cluster administrators identify those images before the upgrade,
 ## Features
 
 - Pod exec-based runtime detection: OS, Java, Node.js, .NET, JVM flags, cgroups v1 references
-- Optional skopeo fallback for images where exec fails (distroless/scratch images)
 - Severity classification: CRITICAL, HIGH, LOW, INFO, OK, UNKNOWN
 - Inspection metadata audit trail (shows what was detected for each image)
 - Clickable severity cards to filter the report table
@@ -26,7 +25,6 @@ This tool helps cluster administrators identify those images before the upgrade,
 - Pagination for large image lists (20/50/100/All)
 - Text filter and severity filter buttons
 - CSV and JSON report download
-- Registry credentials management for private registries (used by skopeo fallback)
 - Skip reason breakdown for excluded pods (system namespaces vs. user-excluded)
 - Background scan with real-time progress reporting
 - PatternFly 6 dark theme (OpenShift Console style)
@@ -47,10 +45,6 @@ Detections performed:
 - **cgroups hierarchy**: checks if the pod runs under cgroups v1 or v2
 - **cgroups v1 file references**: searches application files for hardcoded v1 paths (`memory.limit_in_bytes`, `cpu.cfs_quota_us`, etc.)
 - **cgroups v1 env references**: checks PID 1 environment variables for v1 paths
-
-### Skopeo Fallback (optional)
-
-For images where exec fails (distroless/scratch images without a shell), skopeo can be used as a fallback to inspect image metadata remotely. Disabled by default.
 
 ### Severity Classification
 
@@ -113,14 +107,14 @@ Real-world examples:
 
 #### UNKNOWN -- Could not inspect
 
-The checker was unable to inspect the image. Typically because `oc exec` failed (the pod crashed, the container has no shell, or permissions were denied) and skopeo fallback was not enabled.
+The checker was unable to inspect the image. Typically because `oc exec` failed (the pod crashed, the container has no shell, or permissions were denied).
 
 Real-world examples:
 - `gcr.io/distroless/java17-debian11` -- Distroless images have no shell, exec cannot run
 - Pods in `CrashLoopBackOff` or `Error` state
 - Containers with `securityContext.readOnlyRootFilesystem` and restricted exec permissions
 
-**Action**: Enable skopeo fallback to inspect these images via remote metadata, or verify them manually.
+**Action**: Verify these images manually.
 
 ---
 
@@ -132,12 +126,11 @@ Images found only in initContainers are flagged in the report but receive the sa
 Browser  -->  Flask (Gunicorn, PatternFly v6 dark theme)
                 |
                 +--> Kubernetes API (list pods, read cluster info)
-                +--> pod exec (primary: OS, runtimes, cgroups detection)
-                +--> skopeo inspect (optional fallback for exec failures)
+                +--> pod exec (OS, runtimes, cgroups detection)
                 +--> JSON reports saved to REPORT_DIR
 ```
 
-The application runs inside the OpenShift cluster with a ServiceAccount that has permission to list pods, exec into pods, read secrets (ImagePullSecrets), and read cluster version info.
+The application runs inside the OpenShift cluster with a ServiceAccount that has permission to list pods, exec into pods, and read cluster version info.
 
 ## File Structure
 
@@ -145,14 +138,13 @@ The application runs inside the OpenShift cluster with a ServiceAccount that has
 app/
   app.py             Flask application factory
   config.py          Configuration via environment variables
-  scanner.py         Scanning engine (Kubernetes API + pod exec + skopeo fallback)
+  scanner.py         Scanning engine (Kubernetes API + pod exec)
   routes.py          Web routes (dashboard, reports, CSV download)
-  api.py             REST API (/api/scan, /api/reports, /api/registries)
+  api.py             REST API (/api/scan, /api/reports)
   templates/         Jinja2 templates (PatternFly v6 dark theme)
     base.html        Base layout with sidebar navigation
     dashboard.html   Home page with scan controls and report list
     report.html      Report view with cards, filters, pagination, drilldown
-    registries.html  Registry credentials management
     error.html       Error page
   static/
     css/app.css      Custom styles (dark theme, pagination, cards)
@@ -163,7 +155,7 @@ openshift/           OpenShift deployment manifests
   rbac.yaml          ServiceAccount, ClusterRole, ClusterRoleBinding
   deployment.yaml    Deployment, Service, Route
 setup.sh             Build, push, deploy, and manage script
-Containerfile        Image build (UBI 9 + skopeo + Python 3.11)
+Containerfile        Image build (UBI 9 + Python 3.12)
 gunicorn.conf.py     Gunicorn configuration (1 worker, 4 threads)
 run.py               Application entrypoint
 requirements.txt     Python dependencies
@@ -210,10 +202,9 @@ Global options must come **before** actions. They configure how the actions beha
 | Action | Description |
 |---|---|
 | `--push` | Push the image to Quay.io |
-| `--deploy` | Apply OpenShift manifests (namespace, RBAC, deployment, service, route). Auto-seeds registry credentials on first deploy |
+| `--deploy` | Apply OpenShift manifests (namespace, RBAC, deployment, service, route) |
 | `--build-push-deploy` | Full pipeline: build + push (or mirror) + deploy + restart |
 | `--restart` | Rolling restart of the deployment |
-| `--persistent` | Persist registry credentials to a Kubernetes Secret (survives pod restarts) |
 | `--openshift-status` | Show deployments, pods, services, and routes |
 | `--openshift-logs` | Tail deployment logs (Ctrl+C to exit) |
 | `--remove` | Completely remove the application from OpenShift (with confirmation) |
@@ -267,35 +258,9 @@ All mirror operations explicitly clear proxy env vars to ensure direct connectiv
 
 ### How `--ca-cert` Works
 
-Injects a custom CA certificate into the container image during build. This is needed when a corporate proxy performs TLS interception -- the custom CA must be trusted inside the container for `skopeo` to work correctly.
+Injects a custom CA certificate into the container image during build. This is needed when a corporate proxy performs TLS interception -- the custom CA must be trusted inside the container for pip installs and other network operations during build.
 
 The certificate is copied as `.build-ca.pem` during `podman build` and removed afterwards.
-
-### Auto-Seeded Registry Credentials
-
-On the first `--deploy`, the script automatically:
-
-1. Reads the cluster's global pull-secret (`openshift-config/pull-secret`)
-2. Extracts registry credentials (registry.redhat.io, quay.io, etc.)
-3. Creates a Kubernetes Secret (`cgroups-v2-checker-registries`) with `registries.json`
-4. Patches the Deployment to mount the Secret and sets `REGISTRIES_FILE` env var
-
-This gives the scanner immediate access to all registries configured in the cluster, without manual credential setup.
-
-- Requires read access to `openshift-config/pull-secret` (typically cluster-admin)
-- Skipped if the credentials Secret already exists (preserves user-added credentials)
-- Additional registries can be added via the web UI and persisted with `--persistent`
-
-### How `--persistent` Works
-
-Persists registry credentials to a Kubernetes Secret so they survive pod restarts:
-
-1. Reads `registries.json` from the running pod (credentials added via web UI)
-2. Creates or updates the Secret `cgroups-v2-checker-registries`
-3. Patches the Deployment to mount the Secret
-4. Restarts the Deployment
-
-If no running pod is found, offers interactive manual credential entry.
 
 ---
 
@@ -303,7 +268,7 @@ If no running pod is found, offers interactive manual credential entry.
 
 #### Direct internet access (no proxy)
 
-The simplest case. The cluster can pull from Quay.io and skopeo can reach all registries.
+The simplest case. The cluster can pull from Quay.io directly.
 
 ```bash
 ./setup.sh --build-push-deploy
@@ -311,7 +276,7 @@ The simplest case. The cluster can pull from Quay.io and skopeo can reach all re
 
 #### Corporate proxy, cluster can pull from Quay.io
 
-The cluster can pull the app image from Quay.io, but skopeo needs the proxy to reach external registries for inspection.
+The cluster can pull the app image from Quay.io, but needs the proxy for external access.
 
 ```bash
 # Auto-detect proxy from cluster config
@@ -332,7 +297,7 @@ The cluster cannot reach Quay.io (proxy blocks it, TLS interception, etc.). Push
 
 #### TLS-intercepting proxy with custom CA
 
-The proxy performs TLS inspection and replaces certificates. skopeo will fail without the proxy's CA certificate.
+The proxy performs TLS inspection and replaces certificates. The custom CA must be injected into the container image for pip installs during build.
 
 ```bash
 # Mirror + proxy + custom CA
@@ -367,13 +332,6 @@ podman load -i cgroups-v2-checker.tar
 
 # Quick restart only (no rebuild)
 ./setup.sh --restart
-```
-
-#### Persisting registry credentials after web UI setup
-
-```bash
-# After adding credentials via the web UI:
-./setup.sh --persistent
 ```
 
 #### Individual steps (granular control)
@@ -454,12 +412,7 @@ Access `http://localhost:8080`. Uses the local kubeconfig (`~/.kube/config` or `
 | `SECRET_KEY` | (auto-generated) | Flask secret key |
 | `REPORT_DIR` | `/app/data/reports` | Directory for saving reports |
 | `SKIP_SYSTEM_NAMESPACES` | `true` | Skip openshift-* and kube-* namespaces |
-| `SKOPEO_TLS_VERIFY` | `true` | Verify TLS in skopeo calls |
-| `SKOPEO_AUTH_FILE` | (empty) | Auth file path for private registries |
-| `SKOPEO_MAX_WORKERS` | `20` | Parallel threads for skopeo fallback inspection |
 | `EXEC_MAX_WORKERS` | `20` | Parallel threads for pod exec inspection |
-| `USE_IMAGE_PULL_SECRETS` | `true` | Extract registry auth from pods/ServiceAccounts |
-| `REGISTRIES_FILE` | (empty) | Path to mounted registries.json from K8s Secret |
 | `IMAGE_TAG` | `latest` | Image tag used by setup.sh |
 | `LOCAL_PORT` | `8080` | Local port for `--run-local` |
 
@@ -472,9 +425,6 @@ Access `http://localhost:8080`. Uses the local kubeconfig (`~/.kube/config` or `
 | `GET` | `/api/reports` | List all reports |
 | `GET` | `/api/reports/<id>` | Get a specific report |
 | `DELETE` | `/api/reports/<id>` | Delete a report |
-| `GET` | `/api/registries` | List configured registry credentials |
-| `POST` | `/api/registries` | Add registry credentials |
-| `DELETE` | `/api/registries/<host>` | Remove registry credentials |
 
 ### Start a scan
 
@@ -492,11 +442,10 @@ curl -X POST http://ROUTE_URL/api/scan \
 | `exclude_namespaces` | list | none | Namespaces to exclude |
 | `namespace_patterns` | list | none | Regex patterns to include namespaces |
 | `exclude_patterns` | list | none | Regex patterns to exclude namespaces |
-| `skopeo_fallback` | bool | false | Enable skopeo fallback for images where exec fails |
 
 ## Container Image
 
-The application runs on UBI 9 with Python 3.11 and skopeo pre-installed. Built with Podman and deployable on any OpenShift 4.x cluster.
+The application runs on UBI 9 with Python 3.12. Built with Podman and deployable on any OpenShift 4.x cluster.
 
 ## License
 

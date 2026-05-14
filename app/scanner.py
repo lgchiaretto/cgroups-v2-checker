@@ -2,22 +2,15 @@
 cgroups v2 Compatibility Scanner Engine
 ========================================
 Scans OpenShift clusters for container images that may have cgroups v2
-compatibility issues. Uses pod exec as the primary detection method —
-runs a lightweight script inside each pod to detect OS version, runtime
+compatibility issues. Uses pod exec as the detection method — runs a
+lightweight script inside each pod to detect OS version, runtime
 versions (Java, Node.js, .NET), and cgroups v1 references.
-
-Optionally falls back to skopeo for images where exec is not possible
-(initContainers, distroless/scratch images without a shell).
 """
 
-import base64
 import json
 import logging
 import os
 import re
-import subprocess
-import tempfile
-import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -246,8 +239,7 @@ OPENSHIFT_SYSTEM_NS = {
 class CGroupsV2Scanner:
     """Scans an OpenShift cluster for cgroups v2 compatibility issues.
 
-    Primary detection is via pod exec (runs a script inside each pod).
-    Skopeo is an optional fallback for images where exec fails.
+    Detection is via pod exec (runs a script inside each pod).
     """
 
     _K8S_PAGE_SIZE = 500
@@ -259,31 +251,17 @@ class CGroupsV2Scanner:
         namespace_patterns: Optional[List[str]] = None,
         exclude_patterns: Optional[List[str]] = None,
         skip_system_ns: bool = True,
-        skopeo_fallback: bool = False,
-        skopeo_tls_verify: bool = True,
-        skopeo_auth_file: str = "",
-        max_workers: int = 20,
         progress_callback=None,
-        use_image_pull_secrets: bool = True,
     ):
         self.target_namespaces = namespaces
         self.exclude_namespaces = set(exclude_namespaces or [])
         self._ns_include_patterns = self._compile_patterns(namespace_patterns)
         self._ns_exclude_patterns = self._compile_patterns(exclude_patterns)
         self.skip_system_ns = skip_system_ns
-        self.skopeo_fallback = skopeo_fallback
-        self.skopeo_tls_verify = skopeo_tls_verify
-        self.skopeo_auth_file = skopeo_auth_file
-        self.max_workers = max_workers
         self.progress_callback = progress_callback
-        self.use_image_pull_secrets = use_image_pull_secrets
 
         self.image_reports: Dict[str, ImageReport] = {}
         self.cluster_info: Dict[str, str] = {}
-        self._sa_token: Optional[str] = None
-        self._internal_registry: Optional[str] = None
-        self._registry_auths: Dict[str, dict] = {}
-        self._processed_pull_secrets: Set[str] = set()
         self._image_pod_map: Dict[str, Tuple[str, str, str]] = {}
         self._api_client: Optional[client.ApiClient] = None
 
@@ -326,7 +304,6 @@ class CGroupsV2Scanner:
         try:
             config.load_incluster_config()
             logger.info("Using in-cluster configuration (ServiceAccount).")
-            self._load_sa_token()
         except config.ConfigException:
             config.load_kube_config()
             logger.info("Using local kubeconfig.")
@@ -351,15 +328,6 @@ class CGroupsV2Scanner:
         self._discover_internal_registry()
         self._check_node_info()
 
-    def _load_sa_token(self):
-        token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-        try:
-            if os.path.exists(token_path):
-                with open(token_path) as f:
-                    self._sa_token = f.read().strip()
-        except Exception:
-            pass
-
     def _check_openshift(self):
         try:
             custom = client.CustomObjectsApi(self._api_client)
@@ -380,10 +348,9 @@ class CGroupsV2Scanner:
             )
             reg = ic.get("status", {}).get("internalRegistryHostname", "")
             if reg:
-                self._internal_registry = reg
                 self.cluster_info["internal_registry"] = reg
         except Exception:
-            self._internal_registry = "image-registry.openshift-image-registry.svc:5000"
+            pass
 
     def _check_node_info(self):
         try:
@@ -426,91 +393,6 @@ class CGroupsV2Scanner:
                 break
 
         return all_pods
-
-    # ─────────────────────────────────────────────────────────────────────
-    # ImagePullSecrets extraction (kept for skopeo fallback)
-    # ─────────────────────────────────────────────────────────────────────
-    def _extract_pull_secrets_for_pod(self, pod) -> None:
-        """Extract registry credentials from the pod's ImagePullSecrets."""
-        if not self.use_image_pull_secrets:
-            return
-
-        ns = pod.metadata.namespace
-        secret_refs = []
-
-        if pod.spec.image_pull_secrets:
-            secret_refs.extend(pod.spec.image_pull_secrets)
-
-        sa_name = pod.spec.service_account_name or "default"
-        try:
-            sa = self.v1.read_namespaced_service_account(sa_name, ns)
-            if sa.image_pull_secrets:
-                secret_refs.extend(sa.image_pull_secrets)
-        except ApiException:
-            pass
-
-        for ref in secret_refs:
-            secret_key = f"{ns}/{ref.name}"
-            if secret_key in self._processed_pull_secrets:
-                continue
-            self._processed_pull_secrets.add(secret_key)
-
-            try:
-                secret = self.v1.read_namespaced_secret(ref.name, ns)
-                if not secret.data:
-                    continue
-
-                raw = (
-                    secret.data.get(".dockerconfigjson")
-                    or secret.data.get(".dockercfg")
-                )
-                if not raw:
-                    continue
-
-                docker_config = json.loads(base64.b64decode(raw))
-                auths = docker_config.get("auths", docker_config)
-                for registry, creds in auths.items():
-                    if registry not in self._registry_auths:
-                        self._registry_auths[registry] = creds
-                        logger.debug(f"Loaded pull secret for registry: {registry}")
-            except (ApiException, json.JSONDecodeError, Exception) as e:
-                logger.debug(f"Could not read pull secret {secret_key}: {e}")
-
-    def _build_auth_file_for_image(self, image: str) -> Optional[str]:
-        """Build a temporary auth file for skopeo if we have credentials."""
-        if not self._registry_auths:
-            return None
-
-        registry = self._get_registry_from_image(image)
-        if not registry:
-            return None
-
-        creds = None
-        for reg_key, reg_creds in self._registry_auths.items():
-            normalized_key = reg_key.replace("https://", "").replace("http://", "").rstrip("/")
-            if registry == normalized_key or registry.split(":")[0] == normalized_key.split(":")[0]:
-                creds = reg_creds
-                break
-
-        if not creds:
-            return None
-
-        auth_data = {"auths": {registry: creds}}
-        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
-        json.dump(auth_data, tmp)
-        tmp.close()
-        return tmp.name
-
-    @staticmethod
-    def _get_registry_from_image(image: str) -> Optional[str]:
-        """Extract registry hostname from an image reference."""
-        ref = image.split("@")[0].split(":")[0] if "@" in image else image.rsplit(":", 1)[0]
-        parts = ref.split("/")
-        if len(parts) == 1:
-            return "docker.io"
-        if "." in parts[0] or ":" in parts[0]:
-            return parts[0]
-        return "docker.io"
 
     # ─────────────────────────────────────────────────────────────────────
     # Image collection
@@ -557,9 +439,6 @@ class CGroupsV2Scanner:
             total_pods += 1
             pod_name = pod.metadata.name
 
-            if self.skopeo_fallback:
-                self._extract_pull_secrets_for_pod(pod)
-
             if pod.spec.init_containers:
                 for c in pod.spec.init_containers:
                     if not c.image:
@@ -605,13 +484,11 @@ class CGroupsV2Scanner:
         else:
             self.cluster_info["pods_skipped"] = str(skipped)
         self.cluster_info["unique_images"] = str(len(self.image_reports))
-        self.cluster_info["registry_credentials"] = str(len(self._registry_auths))
 
         self._report_progress("collect", 1, 1,
             f"{total_pods} pods, {len(self.image_reports)} unique images")
         logger.info(f"Collected {total_pods} pods, {len(self.image_reports)} unique images "
-                     f"(skipped {skipped} pods, "
-                     f"{len(self._registry_auths)} registry credentials loaded)")
+                     f"(skipped {skipped} pods)")
 
     @staticmethod
     def _normalize_image(image: str) -> str:
@@ -624,27 +501,11 @@ class CGroupsV2Scanner:
     # Analysis
     # ─────────────────────────────────────────────────────────────────────
     def analyze(self):
-        """Run full analysis on all collected images.
-
-        Primary detection is via pod exec. Skopeo is used as fallback for
-        images where exec failed (optional, behind skopeo_fallback flag).
-        """
-        # Primary: exec-based inspection for all images with running pods
+        """Run full analysis on all collected images via pod exec."""
         self._exec_inspect_all()
 
-        # Optional fallback: skopeo for images where exec failed
-        if self.skopeo_fallback:
-            failed_images = [
-                img for img, r in self.image_reports.items()
-                if not r.inspected and not r.only_in_init
-            ]
-            if failed_images and self._check_skopeo():
-                self._skopeo_inspect_all(failed_images)
-
-
-
     # ─────────────────────────────────────────────────────────────────────
-    # Primary: exec-based inspection
+    # Exec-based inspection
     # ─────────────────────────────────────────────────────────────────────
     def _exec_inspect_all(self):
         """Execute inspection script inside running pods.
@@ -1031,163 +892,6 @@ class CGroupsV2Scanner:
                         ".NET 5+ has full cgroups v2 compatibility since 2020.",
                     ))
                 return
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Skopeo fallback (optional, for images where exec failed)
-    # ─────────────────────────────────────────────────────────────────────
-    def _check_skopeo(self) -> bool:
-        try:
-            result = subprocess.run(
-                ["skopeo", "--version"], capture_output=True, text=True, timeout=10,
-            )
-            return result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            logger.warning("skopeo not found — fallback inspection disabled.")
-            return False
-
-    def _skopeo_inspect_all(self, images: List[str]):
-        """Run skopeo inspection on images where exec failed."""
-        total = len(images)
-        logger.info(f"Skopeo fallback: {total} images to inspect")
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {executor.submit(self._skopeo_inspect_one, img): img for img in images}
-            done = 0
-            for future in as_completed(futures):
-                done += 1
-                img = futures[future]
-                self._report_progress("skopeo_fallback", done, total,
-                    f"Skopeo fallback ({done}/{total}): {img[:60]}")
-                try:
-                    future.result()
-                except Exception as e:
-                    self.image_reports[img].inspection_error = str(e)
-
-    @staticmethod
-    def _parse_skopeo_error(stderr: str, image: str) -> str:
-        """Extract a meaningful error from skopeo's stderr output."""
-        stderr = stderr.strip()
-        msg_match = re.search(r'msg="(.+)"?\s*$', stderr, re.DOTALL)
-        inner = msg_match.group(1).rstrip('"') if msg_match else stderr
-
-        patterns = [
-            (r"unauthorized", "unauthorized – registry credentials required"),
-            (r"authentication required", "authentication required"),
-            (r"no such host", "registry host not found (DNS)"),
-            (r"connection refused", "registry connection refused"),
-            (r"certificate.+unknown authority", "TLS certificate not trusted"),
-            (r"manifest unknown", "manifest not found in registry"),
-            (r"timeout", "registry connection timeout"),
-            (r"no basic auth credentials", "no auth credentials provided"),
-            (r"deleted or has expired", "tag deleted or expired in registry"),
-        ]
-        for pat, friendly in patterns:
-            if re.search(pat, inner, re.IGNORECASE):
-                return f"skopeo: {friendly}"
-
-        return f"skopeo failed: {stderr[:500]}"
-
-    def _skopeo_inspect_one(self, image: str):
-        """Inspect a single image via skopeo (fallback)."""
-        report = self.image_reports[image]
-        cmd = ["skopeo", "inspect"]
-        tmp_auth_file = None
-
-        is_internal = bool(self._internal_registry and self._internal_registry in image)
-
-        if not self.skopeo_tls_verify or is_internal:
-            cmd.append("--tls-verify=false")
-
-        if is_internal and self._sa_token:
-            cmd.extend(["--creds", f"serviceaccount:{self._sa_token}"])
-        elif self.skopeo_auth_file:
-            cmd.extend(["--authfile", self.skopeo_auth_file])
-        elif self._registry_auths:
-            tmp_auth_file = self._build_auth_file_for_image(image)
-            if tmp_auth_file:
-                cmd.extend(["--authfile", tmp_auth_file])
-
-        skopeo_ref = image
-        if "@sha256:" in skopeo_ref:
-            name_part, digest_part = skopeo_ref.split("@", 1)
-            last_slash = name_part.rfind("/")
-            if last_slash >= 0:
-                repo_part = name_part[last_slash + 1:]
-                if ":" in repo_part:
-                    name_part = name_part[:last_slash + 1] + repo_part.rsplit(":", 1)[0]
-            else:
-                if ":" in name_part:
-                    name_part = name_part.rsplit(":", 1)[0]
-            skopeo_ref = f"{name_part}@{digest_part}"
-        cmd.append(f"docker://{skopeo_ref}")
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            if result.returncode != 0:
-                report.inspection_error = self._parse_skopeo_error(result.stderr, image)
-                return
-            data = json.loads(result.stdout)
-        except subprocess.TimeoutExpired:
-            report.inspection_error = "skopeo timeout"
-            return
-        except json.JSONDecodeError:
-            report.inspection_error = "invalid JSON from skopeo"
-            return
-        finally:
-            if tmp_auth_file:
-                try:
-                    os.unlink(tmp_auth_file)
-                except OSError:
-                    pass
-
-        report.inspected = True
-        self._analyze_skopeo_data(report, data)
-
-    def _analyze_skopeo_data(self, report: ImageReport, data: dict):
-        """Analyze skopeo inspection data (fallback path)."""
-        labels = data.get("Labels") or {}
-        env_list = data.get("Env") or []
-        cmd = data.get("Cmd") or []
-        entrypoint = data.get("Entrypoint") or []
-
-        metadata = {
-            "inspection_method": "skopeo",
-            "label_count": len(labels),
-            "env_count": len(env_list),
-        }
-
-        # Check ENV for JAVA_VERSION
-        for env_var in env_list:
-            if isinstance(env_var, str):
-                jm = re.match(r"JAVA_VERSION=(.+)", env_var)
-                if jm:
-                    ver = jm.group(1).strip()
-                    metadata["java_version_env"] = ver
-
-        # cgroups v1 references in ENV/CMD/Entrypoint
-        all_text = " ".join(str(x) for x in entrypoint + cmd + env_list)
-        for v1_path in CGROUPS_V1_PATHS:
-            if v1_path in all_text:
-                report.findings.append(Finding("cgroups v1 Reference (skopeo)", "HIGH",
-                    f"cgroups v1 path reference in image config: {v1_path}",
-                    "Update application to use cgroups v2 unified hierarchy."))
-                break
-        for v1_file in CGROUPS_V1_FILES:
-            if v1_file in all_text:
-                report.findings.append(Finding("cgroups v1 Reference (skopeo)", "HIGH",
-                    f"cgroups v1 file reference in image config: {v1_file}",
-                    "This file does not exist in cgroups v2. Check v1→v2 mapping."))
-                break
-
-        # JVM flags
-        for env_var in env_list:
-            if isinstance(env_var, str):
-                if "-UseContainerSupport" in env_var and ":-UseContainerSupport" in env_var:
-                    report.findings.append(Finding("JVM Configuration (skopeo)", "HIGH",
-                        "-XX:-UseContainerSupport disables container detection",
-                        "Remove this flag. JVM needs it enabled for cgroups v2."))
-
-        report.inspection_metadata = metadata
 
     # ─────────────────────────────────────────────────────────────────────
     # Report generation

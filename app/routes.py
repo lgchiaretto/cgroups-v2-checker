@@ -45,12 +45,6 @@ def download_report(report_id: str):
     )
 
 
-@web_bp.route("/registries")
-def registries_page():
-    """Registry credentials management page."""
-    return render_template("registries.html")
-
-
 @web_bp.route("/reports/<report_id>/csv")
 def download_csv(report_id: str):
     """Download report as CSV.

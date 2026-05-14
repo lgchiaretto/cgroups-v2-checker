@@ -20,7 +20,6 @@ Esta ferramenta ajuda administradores de cluster a identificar essas imagens ant
 ## Funcionalidades
 
 - Deteccao via pod exec: SO, Java, Node.js, .NET, flags JVM, referencias a cgroups v1
-- Fallback opcional via skopeo para imagens onde exec falha (imagens distroless/scratch)
 - Classificacao de severidade: CRITICAL, HIGH, LOW, INFO, OK, UNKNOWN
 - Trilha de auditoria de inspecao (mostra o que foi detectado para cada imagem)
 - Cards de severidade clicaveis para filtrar a tabela de resultados
@@ -28,7 +27,6 @@ Esta ferramenta ajuda administradores de cluster a identificar essas imagens ant
 - Paginacao para listas grandes (20/50/100/Todos)
 - Filtro por texto e botoes de filtro por severidade
 - Download de relatorio em CSV e JSON
-- Gerenciamento de credenciais de registry para registries privados (usado pelo fallback skopeo)
 - Detalhamento de pods excluidos (namespaces de sistema vs. excluidos pelo usuario)
 - Scan em background com progresso em tempo real
 - Tema escuro PatternFly 6 (estilo OpenShift Console)
@@ -49,10 +47,6 @@ Deteccoes realizadas:
 - **Hierarquia cgroups**: verifica se o pod roda sob cgroups v1 ou v2
 - **Referencias a arquivos cgroups v1**: busca em arquivos da aplicacao por paths v1 hardcoded (`memory.limit_in_bytes`, `cpu.cfs_quota_us`, etc.)
 - **Referencias cgroups v1 em ENV**: verifica variaveis de ambiente do PID 1 por paths v1
-
-### Fallback via Skopeo (opcional)
-
-Para imagens onde exec falha (imagens distroless/scratch sem shell), o skopeo pode ser usado como fallback para inspecionar metadados da imagem remotamente. Desabilitado por padrao.
 
 ### Classificacao de Severidade
 
@@ -115,14 +109,14 @@ Exemplos reais:
 
 #### UNKNOWN -- Nao foi possivel inspecionar
 
-O checker nao conseguiu inspecionar a imagem. Geralmente porque o `oc exec` falhou (o pod crashou, o container nao tem shell, ou permissoes foram negadas) e o fallback via skopeo nao estava habilitado.
+O checker nao conseguiu inspecionar a imagem. Geralmente porque o `oc exec` falhou (o pod crashou, o container nao tem shell, ou permissoes foram negadas).
 
 Exemplos reais:
 - `gcr.io/distroless/java17-debian11` -- Imagens distroless nao tem shell, exec nao consegue executar
 - Pods em estado `CrashLoopBackOff` ou `Error`
 - Containers com `securityContext.readOnlyRootFilesystem` e permissoes de exec restritas
 
-**Acao**: Habilitar o fallback via skopeo para inspecionar essas imagens via metadados remotos, ou verificar manualmente.
+**Acao**: Verificar essas imagens manualmente.
 
 ---
 
@@ -134,12 +128,11 @@ Imagens encontradas apenas em initContainers sao sinalizadas no relatorio mas re
 Browser  -->  Flask (Gunicorn, PatternFly v6 dark theme)
                 |
                 +--> Kubernetes API (list pods, get cluster info)
-                +--> pod exec (primario: SO, runtimes, deteccao cgroups)
-                +--> skopeo inspect (fallback opcional para falhas de exec)
+                +--> pod exec (SO, runtimes, deteccao cgroups)
                 +--> JSON reports salvos em /app/data/reports/
 ```
 
-A aplicacao roda dentro do cluster OpenShift com uma ServiceAccount que tem permissao para listar pods, executar comandos em pods, ler secrets (ImagePullSecrets) e ler informacoes do cluster.
+A aplicacao roda dentro do cluster OpenShift com uma ServiceAccount que tem permissao para listar pods, executar comandos em pods e ler informacoes do cluster.
 
 ## Estrutura de Arquivos
 
@@ -147,14 +140,13 @@ A aplicacao roda dentro do cluster OpenShift com uma ServiceAccount que tem perm
 app/
   app.py             Flask application factory
   config.py          Configuracao via variaveis de ambiente
-  scanner.py         Motor de varredura (Kubernetes API + pod exec + skopeo fallback)
+  scanner.py         Motor de varredura (Kubernetes API + pod exec)
   routes.py          Rotas web (dashboard, relatorios, CSV)
-  api.py             API REST (/api/scan, /api/reports, /api/registries)
+  api.py             API REST (/api/scan, /api/reports)
   templates/         Templates Jinja2 (PatternFly v6 dark theme)
     base.html        Layout base com navegacao lateral
     dashboard.html   Pagina inicial com controles de scan
     report.html      Visualizacao de relatorio com cards, filtros, paginacao
-    registries.html  Gerenciamento de credenciais de registry
     error.html       Pagina de erro
   static/
     css/app.css      Estilos customizados (dark theme, paginacao, cards)
@@ -165,7 +157,7 @@ openshift/           Manifests de deploy para OpenShift
   rbac.yaml          ServiceAccount, ClusterRole, ClusterRoleBinding
   deployment.yaml    Deployment, Service, Route
 setup.sh             Script de build, push, deploy e gerenciamento
-Containerfile        Build da imagem (UBI 9 + skopeo + Python 3.11)
+Containerfile        Build da imagem (UBI 9 + Python 3.12)
 gunicorn.conf.py     Configuracao do Gunicorn (1 worker, 4 threads)
 run.py               Entrypoint da aplicacao
 requirements.txt     Dependencias Python
@@ -217,11 +209,10 @@ As opcoes globais devem vir **antes** das acoes. Elas configuram como as acoes s
 | Acao                  | Descricao                                                                                                                                       |
 | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--push`              | Push da imagem para Quay.io                                                                                                                     |
-| `--deploy`            | Aplicar manifests no OpenShift (namespace, RBAC, deployment, service, route). Popula credenciais de registry automaticamente no primeiro deploy |
-| `--build-push-deploy` | Pipeline completa: build + push (ou mirror) + deploy + restart                                                                                  |
-| `--restart`           | Rolling restart do deployment                                                                                                                   |
-| `--persistent`        | Persistir credenciais de registry em um Kubernetes Secret (sobrevive a restarts de pod)                                                         |
-| `--openshift-status`  | Mostrar deployments, pods, services e routes                                                                                                    |
+| `--deploy`            | Aplicar manifests no OpenShift (namespace, RBAC, deployment, service, route)  |
+| `--build-push-deploy` | Pipeline completa: build + push (ou mirror) + deploy + restart               |
+| `--restart`           | Rolling restart do deployment                                                |
+| `--openshift-status`  | Mostrar deployments, pods, services e routes                                 |
 | `--openshift-logs`    | Acompanhar logs do deployment (Ctrl+C para sair)                                                                                                |
 | `--remove`            | Remover completamente a aplicacao do OpenShift (com confirmacao)                                                                                |
 
@@ -277,35 +268,9 @@ Todas as operacoes de mirror limpam explicitamente as variaveis de proxy para ga
 
 ### Como funciona o `--ca-cert`
 
-Injeta um certificado CA customizado na imagem durante o build. Necessario quando um proxy corporativo faz interceptacao TLS -- o CA do proxy precisa ser confiavel dentro do container para o `skopeo` funcionar corretamente.
+Injeta um certificado CA customizado na imagem durante o build. Necessario quando um proxy corporativo faz interceptacao TLS -- o CA do proxy precisa ser confiavel dentro do container para pip installs e outras operacoes de rede durante o build.
 
 O certificado e copiado como `.build-ca.pem` durante o `podman build` e removido em seguida.
-
-### Credenciais de registry auto-populadas
-
-No primeiro `--deploy`, o script automaticamente:
-
-1. Le o pull-secret global do cluster (`openshift-config/pull-secret`)
-2. Extrai credenciais de registries (registry.redhat.io, quay.io, etc.)
-3. Cria um Kubernetes Secret (`cgroups-v2-checker-registries`) com `registries.json`
-4. Faz patch no Deployment para montar o Secret e define a env var `REGISTRIES_FILE`
-
-Isso da ao scanner acesso imediato a todos os registries configurados no cluster, sem necessidade de configuracao manual.
-
-- Requer acesso de leitura ao `openshift-config/pull-secret` (normalmente cluster-admin)
-- Ignorado se o Secret de credenciais ja existir (preserva credenciais adicionadas pelo usuario)
-- Registries adicionais podem ser adicionados pela interface web e persistidos com `--persistent`
-
-### Como funciona o `--persistent`
-
-Persiste credenciais de registry em um Kubernetes Secret para sobreviver a restarts de pod:
-
-1. Le `registries.json` do pod em execucao (credenciais adicionadas pela interface web)
-2. Cria ou atualiza o Secret `cgroups-v2-checker-registries`
-3. Faz patch no Deployment para montar o Secret
-4. Reinicia o Deployment
-
-Se nao encontrar pod em execucao, oferece entrada interativa manual de credenciais.
 
 ---
 
@@ -313,7 +278,7 @@ Se nao encontrar pod em execucao, oferece entrada interativa manual de credencia
 
 #### Acesso direto a internet (sem proxy)
 
-O caso mais simples. O cluster consegue puxar do Quay.io e o skopeo alcanca todos os registries.
+O caso mais simples. O cluster consegue puxar do Quay.io diretamente.
 
 ```bash
 ./setup.sh --deploy
@@ -321,7 +286,7 @@ O caso mais simples. O cluster consegue puxar do Quay.io e o skopeo alcanca todo
 
 #### Proxy corporativo, cluster consegue puxar do Quay.io
 
-O cluster puxa a imagem do app do Quay.io normalmente, mas o skopeo precisa do proxy para alcancar registries externos na inspecao.
+O cluster puxa a imagem do app do Quay.io normalmente, mas precisa do proxy para acesso externo.
 
 ```bash
 # Auto-detectar proxy da configuracao do cluster
@@ -342,7 +307,7 @@ O cluster nao alcanca o Quay.io (proxy bloqueia, interceptacao TLS, etc.). A ima
 
 #### Proxy com interceptacao TLS e CA customizado
 
-O proxy faz inspecao TLS e substitui certificados. O skopeo vai falhar sem o certificado CA do proxy.
+O proxy faz inspecao TLS e substitui certificados. O CA customizado precisa ser injetado na imagem para pip installs durante o build.
 
 ```bash
 # Mirror + proxy + CA customizado
@@ -377,13 +342,6 @@ podman load -i cgroups-v2-checker.tar
 
 # Apenas restart rapido (sem rebuild)
 ./setup.sh --restart
-```
-
-#### Persistir credenciais de registry apos configuracao pela web UI
-
-```bash
-# Apos adicionar credenciais pela interface web:
-./setup.sh --persistent
 ```
 
 #### Passos individuais (controle granular)
@@ -464,17 +422,12 @@ Acesse `http://localhost:8080`. A conexao ao cluster usa o kubeconfig local (`~/
 
 | Variavel                 | Padrao                   | Descricao                                           |
 | ------------------------ | ------------------------ | --------------------------------------------------- |
-| `SECRET_KEY`             | (gerado automaticamente) | Chave secreta do Flask                              |
-| `REPORT_DIR`             | `/app/data/reports`      | Diretorio para salvar relatorios                    |
-| `SKIP_SYSTEM_NAMESPACES` | `true`                   | Pular namespaces de sistema do OpenShift            |
-| `SKOPEO_TLS_VERIFY`      | `true`                   | Verificar TLS nas chamadas do skopeo                |
-| `SKOPEO_AUTH_FILE`       | (vazio)                  | Arquivo de autenticacao para registries privados    |
-| `SKOPEO_MAX_WORKERS`     | `20`                     | Threads paralelas para inspecao fallback via skopeo |
-| `EXEC_MAX_WORKERS`       | `20`                     | Threads paralelas para inspecao via pod exec        |
-| `USE_IMAGE_PULL_SECRETS` | `true`                   | Extrair auth de registries dos pods/ServiceAccounts |
-| `REGISTRIES_FILE`        | (vazio)                  | Caminho para registries.json montado de K8s Secret  |
-| `IMAGE_TAG`              | `latest`                 | Tag da imagem usada pelo setup.sh                   |
-| `LOCAL_PORT`             | `8080`                   | Porta local para `--run-local`                      |
+| `SECRET_KEY`             | (gerado automaticamente) | Chave secreta do Flask                       |
+| `REPORT_DIR`             | `/app/data/reports`      | Diretorio para salvar relatorios             |
+| `SKIP_SYSTEM_NAMESPACES` | `true`                   | Pular namespaces de sistema do OpenShift     |
+| `EXEC_MAX_WORKERS`       | `20`                     | Threads paralelas para inspecao via pod exec |
+| `IMAGE_TAG`              | `latest`                 | Tag da imagem usada pelo setup.sh            |
+| `LOCAL_PORT`             | `8080`                   | Porta local para `--run-local`               |
 
 
 ## API REST
@@ -482,14 +435,11 @@ Acesse `http://localhost:8080`. A conexao ao cluster usa o kubeconfig local (`~/
 
 | Metodo   | Endpoint                 | Descricao                         |
 | -------- | ------------------------ | --------------------------------- |
-| `POST`   | `/api/scan`              | Iniciar nova varredura            |
-| `GET`    | `/api/scan/<id>`         | Status e progresso da varredura   |
-| `GET`    | `/api/reports`           | Listar todos os relatorios        |
-| `GET`    | `/api/reports/<id>`      | Obter relatorio especifico        |
-| `DELETE` | `/api/reports/<id>`      | Remover relatorio                 |
-| `GET`    | `/api/registries`        | Listar credenciais de registry    |
-| `POST`   | `/api/registries`        | Adicionar credenciais de registry |
-| `DELETE` | `/api/registries/<host>` | Remover credenciais de registry   |
+| `POST`   | `/api/scan`         | Iniciar nova varredura          |
+| `GET`    | `/api/scan/<id>`    | Status e progresso da varredura |
+| `GET`    | `/api/reports`      | Listar todos os relatorios      |
+| `GET`    | `/api/reports/<id>` | Obter relatorio especifico      |
+| `DELETE` | `/api/reports/<id>` | Remover relatorio               |
 
 
 ### Exemplo: Iniciar varredura
@@ -505,16 +455,15 @@ curl -X POST http://cgroups-v2-checker-route/api/scan \
 
 | Campo                | Tipo | Padrao | Descricao                                                    |
 | -------------------- | ---- | ------ | ------------------------------------------------------------ |
-| `namespaces`         | list | todos  | Namespaces especificos para varrer                           |
-| `exclude_namespaces` | list | nenhum | Namespaces para excluir                                      |
-| `namespace_patterns` | list | nenhum | Padroes regex para incluir namespaces                        |
-| `exclude_patterns`   | list | nenhum | Padroes regex para excluir namespaces                        |
-| `skopeo_fallback`    | bool | false  | Habilitar fallback via skopeo para imagens onde exec falha   |
+| `namespaces`         | list | todos  | Namespaces especificos para varrer    |
+| `exclude_namespaces` | list | nenhum | Namespaces para excluir               |
+| `namespace_patterns` | list | nenhum | Padroes regex para incluir namespaces |
+| `exclude_patterns`   | list | nenhum | Padroes regex para excluir namespaces |
 
 
 ## Imagem Container
 
-A aplicacao roda em UBI 9 com Python 3.11 e skopeo pre-instalados. Construida com Podman e implantavel em qualquer cluster OpenShift 4.x.
+A aplicacao roda em UBI 9 com Python 3.12. Construida com Podman e implantavel em qualquer cluster OpenShift 4.x.
 
 ## Licenca
 

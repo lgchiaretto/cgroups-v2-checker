@@ -9,15 +9,15 @@ OpenShift cgroups v2 scanner — Flask web app that scans clusters for container
 
 ## Tech Stack
 
-- **Backend**: Python 3.11, Flask 3.x, Gunicorn
+- **Backend**: Python 3.12, Flask 3.x, Gunicorn
 - **Frontend**: PatternFly 6 (dark theme), vanilla JS (no frameworks)
-- **Container**: Podman, UBI 9 base, skopeo for image inspection
+- **Container**: Podman, UBI 9 base
 - **Platform**: Red Hat OpenShift, deployed via `oc` CLI
 - **Registry**: `quay.io/chiaretto/cgroups-v2-checker` or OCP internal registry via `--mirror`
 
 ## Architecture
 
-- `app/scanner.py` — Core scan engine (K8s API + skopeo + exec). 3 levels: name/tag analysis, skopeo remote inspection, pod exec runtime detection. Includes `inspection_metadata` audit trail and insufficient metadata detection.
+- `app/scanner.py` — Core scan engine (K8s API + pod exec). Runs a detection script inside each pod to check OS, runtimes, JVM flags, and cgroups v1 references. Includes `inspection_metadata` audit trail.
 - `app/api.py` — REST API (`/api/scan`, `/api/reports`). Scans run async in background thread
 - `app/routes.py` — Web routes (HTML pages, CSV download)
 - `app/app.py` — Flask factory
@@ -48,11 +48,11 @@ Image is pushed to `quay.io/chiaretto/cgroups-v2-checker`. Use when the cluster 
 
 ### Mode 2: Enterprise / Internal Registry (corporate clusters behind proxy)
 
-Image is pushed to the OCP internal registry via `--mirror`. Used in corporate environments with HTTP proxy and private registries (e.g. `quay.intraservice.corp`).
+Image is pushed to the OCP internal registry via `--mirror`. Used in corporate environments with HTTP proxy.
 
-**First-time setup (configure proxy + persist registry creds):**
+**First-time setup (configure proxy):**
 ```bash
-./setup.sh --proxy auto --ca-cert /etc/pki/tls/certs/ca-bundle.crt --persistent --deploy
+./setup.sh --proxy auto --ca-cert /etc/pki/tls/certs/ca-bundle.crt --deploy
 ```
 
 **Subsequent deploys (build + push to internal registry):**
@@ -64,21 +64,16 @@ Image is pushed to the OCP internal registry via `--mirror`. Used in corporate e
 - `--proxy auto` — Reads HTTP_PROXY/NO_PROXY from `oc get proxy cluster` and injects into the deployment
 - `--ca-cert <file>` — Injects CA certificate into the container image (for proxy TLS interception during build)
 - `--mirror` — Pushes image to OCP internal registry instead of Quay.io
-- `--persistent` — Persists registry credentials (for enterprise registries) as a K8s Secret so they survive pod restarts
 
 ### Important: Enterprise environment behavior
 
-- **Proxy & K8s API**: The Python `kubernetes` client explicitly disables proxy (`Configuration.proxy = ""`) to connect directly to the API server. The proxy env vars are only used by skopeo for registry access.
-- **skopeo TLS verification**: Set to `SKOPEO_TLS_VERIFY=false` in the deployment manifest. Enterprise registries (e.g. `quay.intraservice.corp`) use internal CA certificates. Rather than injecting every CA into the container, skopeo skips TLS verification. Auth is still enforced via ImagePullSecrets.
+- **Proxy & K8s API**: The Python `kubernetes` client explicitly disables proxy (`Configuration.proxy = ""`) to connect directly to the API server. The proxy env vars are only needed during build.
 - **Image signature policy**: Some enterprise clusters enforce `ClusterImagePolicy` that rejects unsigned images from the internal registry. If `--mirror` fails with `SignatureValidationFailed`, the cluster admin must add an exception or use Quay.io mode instead.
 
 ## Key Patterns
 
 - Paginated K8s pod listing (`_K8S_PAGE_SIZE = 500`)
-- ImagePullSecrets extracted from pods/ServiceAccounts for private registry auth
 - Reports stored as JSON in `REPORT_DIR` (default: `/app/data/reports`)
-- initContainer-only images get severity downgraded one level
-- Images without base image labels flagged as "Insufficient Metadata" (LOW)
-- `inspection_metadata` in report JSON shows what skopeo found (audit trail)
-- `--deploy` auto-seeds registry creds from cluster pull-secret on first deploy
+- initContainer-only images flagged in the report
+- `inspection_metadata` in report JSON shows what was detected (audit trail)
 - Test locally: `python run.py` on port 8080
