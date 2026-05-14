@@ -1,16 +1,46 @@
 ---
-- name: Create cgroups v2 checker test lab
+# main.yaml - Deploy cgroups v2 Checker test lab workloads on OpenShift
+#
+# Creates sample workloads with various Java, Node.js, and OS versions
+# to exercise the cgroups v2 Checker scanner across severity levels.
+#
+# Variables injected by run-product.yaml:
+#   cluster_kubeconfig, clustername, cluster_api_url,
+#   cluster_kubeadmin_password, product_name, domain,
+#   provisioner_url, provisioner_token, product_deployment_id
+
+- name: Deploy cgroups v2 Checker test lab
   hosts: localhost
   connection: local
   gather_facts: false
+
+  vars:
+    kubeconfig_path: >-
+      {{ (lookup('env', 'TMPDIR') | default('/tmp', true)) ~ '/cgv2-kubeconfig-' ~
+      (clustername | default('cluster') | regex_replace('[^a-zA-Z0-9_-]', '-')) }}
 
   vars_files:
     - vars/lab.yaml
 
   tasks:
+    - name: Require cluster kubeconfig
+      ansible.builtin.assert:
+        that:
+          - cluster_kubeconfig is defined
+          - cluster_kubeconfig | length > 0
+          - cluster_kubeconfig is search('apiVersion:', ignorecase=False)
+        fail_msg: "cluster_kubeconfig is required."
+
+    - name: Write kubeconfig for kubernetes.core
+      ansible.builtin.copy:
+        dest: "{{ kubeconfig_path }}"
+        mode: '0600'
+        content: "{{ cluster_kubeconfig }}"
+      no_log: true
+
     - name: Verify cluster is reachable
       kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
+        kubeconfig: "{{ kubeconfig_path }}"
         api_version: config.openshift.io/v1
         kind: ClusterVersion
         name: version
@@ -22,7 +52,7 @@
 
     - name: Create namespaces
       kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
+        kubeconfig: "{{ kubeconfig_path }}"
         state: present
         definition:
           apiVersion: v1
@@ -37,7 +67,7 @@
 
     - name: Deploy standard containers
       kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
+        kubeconfig: "{{ kubeconfig_path }}"
         state: present
         definition: "{{ lookup('ansible.builtin.template', 'templates/deployment.yaml.j2') }}"
       vars:
@@ -50,7 +80,7 @@
 
     - name: Deploy multi-container and initContainer workloads
       kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
+        kubeconfig: "{{ kubeconfig_path }}"
         state: present
         definition: "{{ lookup('ansible.builtin.template', 'templates/deployment-multi.yaml.j2') }}"
       vars:
@@ -63,7 +93,7 @@
 
     - name: Wait for deployments
       kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
+        kubeconfig: "{{ kubeconfig_path }}"
         api_version: apps/v1
         kind: Deployment
         namespace: "{{ lab_prefix }}-{{ item.0.name }}"
@@ -78,6 +108,10 @@
       loop_control:
         label: "{{ lab_prefix }}-{{ item.0.name }}/{{ item.1.name }}"
 
+    - name: Count total pods
+      ansible.builtin.set_fact:
+        total_pods: "{{ namespaces | map(attribute='deployments') | flatten | map(attribute='replicas', default=1) | map('int') | sum }}"
+
     - name: Lab summary
       ansible.builtin.debug:
         msg: |
@@ -91,5 +125,38 @@
           {% endfor %}
           {% endfor %}
           ╠══════════════════════════════════════════════════════════════╣
-          ║  Total: ~{{ namespaces | map(attribute='deployments') | flatten | map(attribute='replicas', default=1) | map('int') | sum }} pods across {{ namespaces | length }} namespaces              ║
+          ║  Total: ~{{ total_pods }} pods across {{ namespaces | length }} namespaces              ║
           ╚══════════════════════════════════════════════════════════════╝
+
+    - name: Publish application credentials to Provisioner
+      ansible.builtin.uri:
+        url: "{{ provisioner_url | regex_replace('/+$', '') }}/api/v1/products/deployments/{{ product_deployment_id }}/credentials"
+        method: POST
+        body_format: json
+        headers:
+          Authorization: "Bearer {{ provisioner_token }}"
+          Content-Type: "application/json"
+        body:
+          items:
+            - title: "cgroups v2 Checker — Test Lab"
+              url: ""
+              username: ""
+              password: ""
+              description: "{{ total_pods }} test pods across {{ namespaces | length }} namespaces ({{ lab_prefix }}-*)"
+        status_code:
+          - 200
+        validate_certs: false
+      when:
+        - product_deployment_id is defined
+        - product_deployment_id | string | length > 0
+        - provisioner_token is defined
+        - provisioner_token | string | length > 0
+        - provisioner_url is defined
+        - provisioner_url | string | length > 0
+      ignore_errors: true
+
+    - name: Remove kubeconfig file
+      ansible.builtin.file:
+        path: "{{ kubeconfig_path }}"
+        state: absent
+      no_log: true

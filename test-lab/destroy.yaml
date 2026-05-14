@@ -1,16 +1,44 @@
 ---
-- name: Destroy cgroups v2 checker test lab
+# destroy.yaml - Remove cgroups v2 Checker test lab workloads
+#
+# Deletes all lab namespaces (cgv2-lab-*) created by the install playbook.
+#
+# Variables injected by destroy-product.yaml:
+#   cluster_kubeconfig, clustername, product_name,
+#   provisioner_url, provisioner_token, product_deployment_id
+
+- name: Destroy cgroups v2 Checker test lab
   hosts: localhost
   connection: local
   gather_facts: false
+
+  vars:
+    kubeconfig_path: >-
+      {{ (lookup('env', 'TMPDIR') | default('/tmp', true)) ~ '/cgv2-kubeconfig-' ~
+      (clustername | default('cluster') | regex_replace('[^a-zA-Z0-9_-]', '-')) }}
 
   vars_files:
     - vars/lab.yaml
 
   tasks:
+    - name: Require cluster kubeconfig
+      ansible.builtin.assert:
+        that:
+          - cluster_kubeconfig is defined
+          - cluster_kubeconfig | length > 0
+          - cluster_kubeconfig is search('apiVersion:', ignorecase=False)
+        fail_msg: "cluster_kubeconfig is required."
+
+    - name: Write kubeconfig for kubernetes.core
+      ansible.builtin.copy:
+        dest: "{{ kubeconfig_path }}"
+        mode: '0600'
+        content: "{{ cluster_kubeconfig }}"
+      no_log: true
+
     - name: Delete lab namespaces
       kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig }}"
+        kubeconfig: "{{ kubeconfig_path }}"
         state: absent
         api_version: v1
         kind: Namespace
@@ -21,7 +49,7 @@
 
     - name: Wait for namespace deletion
       kubernetes.core.k8s_info:
-        kubeconfig: "{{ kubeconfig }}"
+        kubeconfig: "{{ kubeconfig_path }}"
         api_version: v1
         kind: Namespace
         name: "{{ lab_prefix }}-{{ item.name }}"
@@ -36,3 +64,9 @@
     - name: Cleanup complete
       ansible.builtin.debug:
         msg: "All {{ namespaces | length }} lab namespaces ({{ lab_prefix }}-*) deleted."
+
+    - name: Remove kubeconfig file
+      ansible.builtin.file:
+        path: "{{ kubeconfig_path }}"
+        state: absent
+      no_log: true

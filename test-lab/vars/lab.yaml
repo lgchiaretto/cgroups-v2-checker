@@ -1,6 +1,5 @@
 ---
 lab_prefix: cgv2-lab
-kubeconfig: "{{ lookup('ansible.builtin.env', 'KUBECONFIG', default='~/.kube/config') }}"
 
 default_resources:
   requests:
