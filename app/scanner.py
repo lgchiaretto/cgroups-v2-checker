@@ -436,6 +436,8 @@ class CGroupsV2Scanner:
                 skipped_not_running += 1
                 continue
 
+            running_containers = self._get_running_containers(pod)
+
             total_pods += 1
             pod_name = pod.metadata.name
 
@@ -462,7 +464,7 @@ class CGroupsV2Scanner:
                     r.namespaces.add(ns)
                     r.pods.add(f"{ns}/{pod_name}")
                     r.containers.add(c.name)
-                    if is_running and img not in self._image_pod_map:
+                    if c.name in running_containers and img not in self._image_pod_map:
                         self._image_pod_map[img] = (ns, pod_name, c.name)
 
         for report in self.image_reports.values():
@@ -489,6 +491,15 @@ class CGroupsV2Scanner:
             f"{total_pods} pods, {len(self.image_reports)} unique images")
         logger.info(f"Collected {total_pods} pods, {len(self.image_reports)} unique images "
                      f"(skipped {skipped} pods)")
+
+    @staticmethod
+    def _get_running_containers(pod) -> Set[str]:
+        """Return names of containers actually running (not CrashLoopBackOff, waiting, etc.)."""
+        running = set()
+        for cs in (pod.status.container_statuses or []):
+            if cs.state and cs.state.running:
+                running.add(cs.name)
+        return running
 
     @staticmethod
     def _normalize_image(image: str) -> str:
@@ -575,8 +586,8 @@ class CGroupsV2Scanner:
             return
 
         if not output or "===DONE===" not in output:
-            report.inspection_error = "exec returned incomplete output (no shell?)"
-            logger.debug(f"Exec incomplete for {pod_ref}")
+            report.inspection_error = self._diagnose_exec_failure(output)
+            logger.debug(f"Exec incomplete for {pod_ref}: {report.inspection_error}")
             return
 
         report.inspected = True
@@ -659,6 +670,40 @@ class CGroupsV2Scanner:
 
         # Fallback: truncate to something reasonable
         return err_str[:150] if len(err_str) > 150 else err_str
+
+    @staticmethod
+    def _diagnose_exec_failure(output: str) -> str:
+        """Produce a clear message when exec output is missing or incomplete.
+
+        Common cause: distroless / scratch images with no /bin/sh.
+        The OCI runtime returns "no such file or directory" or similar,
+        which may appear in the captured output or as empty output.
+        """
+        if not output:
+            return (
+                "Distroless image — no shell available. "
+                "The container has no /bin/sh, so it cannot be inspected via exec. "
+                "Typically Go/Rust/static binaries without cgroups v2 concerns."
+            )
+
+        lower = output.lower()
+        if "no such file or directory" in lower or "executable file not found" in lower:
+            return (
+                "Distroless image — no shell available. "
+                "The container has no /bin/sh, so it cannot be inspected via exec. "
+                "Typically Go/Rust/static binaries without cgroups v2 concerns."
+            )
+
+        if "permission denied" in lower:
+            return (
+                "Shell execution denied — the container's security context "
+                "or read-only filesystem prevented exec."
+            )
+
+        return (
+            "Exec returned incomplete output — the container shell may be "
+            "restricted or the image may be minimal/distroless."
+        )
 
     # ─────────────────────────────────────────────────────────────────────
     # Exec output parsing
@@ -781,9 +826,9 @@ class CGroupsV2Scanner:
                 ubuntu_ver = float(version_id)
                 if ubuntu_ver < 20.04:
                     report.findings.append(Finding(
-                        "Operating System", "HIGH",
+                        "Operating System", "CRITICAL",
                         f"Ubuntu {version_id} — limited cgroups v2 support",
-                        "Migrate to a valid image",
+                        "Migrate to Ubuntu 22.04+ or UBI 8/9.",
                         f"OS: {pretty_name or f'Ubuntu {version_id}'}",
                     ))
             except ValueError:
@@ -794,9 +839,9 @@ class CGroupsV2Scanner:
             try:
                 if int(major_version) < 11:
                     report.findings.append(Finding(
-                        "Operating System", "HIGH",
+                        "Operating System", "CRITICAL",
                         f"Debian {version_id} — limited cgroups v2 support",
-                        "Migrate to a valid image",
+                        "Migrate to Debian 11+ or UBI 8/9.",
                         f"OS: {pretty_name or f'Debian {version_id}'}",
                     ))
             except ValueError:
@@ -809,9 +854,9 @@ class CGroupsV2Scanner:
                 alpine_major, alpine_minor = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
                 if alpine_major == 3 and alpine_minor < 14:
                     report.findings.append(Finding(
-                        "Operating System", "HIGH",
+                        "Operating System", "CRITICAL",
                         f"Alpine {version_id} — requires upgrade for cgroups v2",
-                        "Migrate to a valid image",
+                        "Migrate to Alpine 3.14+ or UBI 8/9.",
                         f"OS: {pretty_name or f'Alpine {version_id}'}",
                     ))
             except (ValueError, IndexError):
@@ -857,9 +902,8 @@ class CGroupsV2Scanner:
         metadata["java_cgroups_v2_safe"] = safe
 
         if not safe:
-            sev = "CRITICAL" if major < 11 else "HIGH"
             report.findings.append(Finding(
-                "Java Runtime", sev,
+                "Java Runtime", "HIGH",
                 f"Java {real_version} — does not support cgroups v2",
                 f"{JAVA_DETAIL} Safe versions: {JAVA_SAFE_VERSIONS}",
                 f"Verified via 'java -version' in pod {pod_ref}",
