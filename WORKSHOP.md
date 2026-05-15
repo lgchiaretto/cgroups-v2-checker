@@ -81,27 +81,6 @@ Run a scan against the cluster workloads to see the scanner in action. The test 
 2. Watch the real-time progress bar as pods are inspected
 3. When complete, click the report to see results
 
-**Via the API:**
-
-```bash
-curl -sk -X POST https://${ROUTE_URL}/api/scan \
-  -H "Content-Type: application/json" \
-  -d '{}'
-```
-
-This returns a scan ID. Monitor progress:
-
-```bash
-# Replace <scan-id> with the returned ID
-curl -sk https://${ROUTE_URL}/api/scan/<scan-id> | python3 -m json.tool
-```
-
-Wait until `"status": "completed"`, then list the reports:
-
-```bash
-curl -sk https://${ROUTE_URL}/api/reports | python3 -m json.tool
-```
-
 ---
 
 ## 6. Understand the Test Lab Workloads
@@ -116,16 +95,6 @@ The product installation automatically deployed sample workloads with intentiona
 | `cgv2-lab-mixed` | Multi-container with CentOS 7 sidecar, initContainer, JVM flags | CRITICAL, HIGH, OK |
 | `cgv2-lab-apps-1` | API gateway, auth, order, notification, frontend (all safe) | OK |
 | `cgv2-lab-apps-2` | Billing, report, cache, metrics (all safe) | OK |
-
-Verify the test lab pods are running:
-
-```bash
-for ns in java os node mixed apps-1 apps-2; do
-  echo "=== cgv2-lab-${ns} ==="
-  oc get pods -n cgv2-lab-${ns}
-  echo
-done
-```
 
 ---
 
@@ -214,14 +183,6 @@ Download the scan results for offline analysis or sharing:
 
 **JSON format** (via API):
 
-```bash
-# List reports
-curl -sk https://${ROUTE_URL}/api/reports | python3 -m json.tool
-
-# Download a specific report (replace <report-id>)
-curl -sk https://${ROUTE_URL}/api/reports/<report-id> -o report.json
-```
-
 ---
 
 ## 11. Cleanup: Remove the cgroups v2 Checker
@@ -254,9 +215,8 @@ This deletes the deployment, service, route, RBAC (ClusterRole, ClusterRoleBindi
 
 | Severity | Meaning | Action |
 |----------|---------|--------|
-| **CRITICAL** | Incompatible base OS (CentOS 7, RHEL 7, old Ubuntu/Debian) or very old Java (< 8u372) | Rebuild on supported base image before OCP 4.19 upgrade |
-| **HIGH** | Runtime needs update (Java < 11.0.16, Node.js < 20, JVM flags disabling container support) | Update runtime version or fix configuration |
-| **LOW** | Minor risk, insufficient metadata | Review when convenient |
+| **CRITICAL** | Incompatible base OS (CentOS 7, RHEL 7, old Ubuntu/Debian) | Rebuild on supported base image before OCP 4.19 upgrade |
+| **HIGH** | Runtime needs update (Java < 11.0.16, Node.js < 20, JVM flags disabling container support) or very old Java (< 8u372) | Update runtime version or fix configuration |
 | **INFO** | Informational | No action needed |
 | **OK** | Fully compatible | No action needed |
 | **UNKNOWN** | Could not inspect (no shell, crash, permissions) | Verify manually |

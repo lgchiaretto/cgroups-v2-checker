@@ -749,7 +749,7 @@ class CGroupsV2Scanner:
                     report.findings.append(Finding(
                         "Operating System", "HIGH",
                         f"Ubuntu {version_id} — limited cgroups v2 support",
-                        "Migrate to Ubuntu 20.04+ (Focal) or 22.04+ (Jammy).",
+                        "Migrate to a valid image",
                         f"OS: {pretty_name or f'Ubuntu {version_id}'}",
                     ))
             except ValueError:
@@ -762,7 +762,7 @@ class CGroupsV2Scanner:
                     report.findings.append(Finding(
                         "Operating System", "HIGH",
                         f"Debian {version_id} — limited cgroups v2 support",
-                        "Migrate to Debian 11 (Bullseye) or later.",
+                        "Migrate to a valid image",
                         f"OS: {pretty_name or f'Debian {version_id}'}",
                     ))
             except ValueError:
@@ -777,7 +777,7 @@ class CGroupsV2Scanner:
                     report.findings.append(Finding(
                         "Operating System", "HIGH",
                         f"Alpine {version_id} — requires upgrade for cgroups v2",
-                        "Migrate to Alpine 3.14+.",
+                        "Migrate to a valid image",
                         f"OS: {pretty_name or f'Alpine {version_id}'}",
                     ))
             except (ValueError, IndexError):
