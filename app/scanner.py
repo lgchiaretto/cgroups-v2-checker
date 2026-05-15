@@ -588,6 +588,9 @@ class CGroupsV2Scanner:
 
         The kubernetes client wraps websocket/HTTP errors with verbose
         headers and response bodies. This extracts just the useful part.
+        For websocket handshake failures (ApiException status=0), the
+        reason field contains the full HTTP response — parse it for
+        known patterns before falling back to the generic message.
         """
         err_str = str(exc)
 
@@ -597,9 +600,36 @@ class CGroupsV2Scanner:
                     return "exec forbidden (RBAC)"
                 if exc.status == 404:
                     return "pod no longer running"
-                return f"API error: {exc.status} {exc.reason}"
 
-        # Parse "container not found" from websocket handshake errors
+                reason = exc.reason or ""
+
+                # Websocket handshake failures (status=0) carry the real
+                # error buried in the reason/body. Check known patterns
+                # before returning the raw message.
+                m = re.search(r'container not found', reason)
+                if m:
+                    cn = re.search(r'container not found \(\\?"([^"\\]+)\\?"\)', reason)
+                    name = cn.group(1) if cn else "unknown"
+                    return f'container not found ("{name}")'
+
+                if "connection refused" in reason:
+                    m = re.search(r'dial tcp ([^\s:]+:\d+)', reason)
+                    addr = m.group(1) if m else "node"
+                    return f"node kubelet unreachable ({addr})"
+
+                if "not found" in reason.lower() and "pod" in reason.lower():
+                    return "pod no longer running"
+
+                # For status=0 (websocket errors), don't dump the full reason
+                if exc.status == 0:
+                    m = re.search(r'Handshake status (\d+)', reason)
+                    if m:
+                        return f"exec handshake error (HTTP {m.group(1)})"
+                    return f"exec failed (websocket error)"
+
+                return f"API error: {exc.status} {reason[:100]}"
+
+        # Parse "container not found" from non-ApiException errors
         m = re.search(r'container not found \("([^"]+)"\)', err_str)
         if m:
             return f'container not found ("{m.group(1)}")'
@@ -610,6 +640,10 @@ class CGroupsV2Scanner:
             return "pod no longer running"
         if "not found" in err_str.lower() and "pod" in err_str.lower():
             return "pod no longer running"
+
+        # Connection refused
+        if "connection refused" in err_str.lower():
+            return "node kubelet unreachable"
 
         # Handshake status errors
         m = re.search(r'Handshake status (\d+)', err_str)
